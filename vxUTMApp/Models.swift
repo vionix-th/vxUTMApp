@@ -64,3 +64,43 @@ public struct SnapshotTagStatus: Identifiable, Hashable {
     self.id = tag
   }
 }
+
+public enum VMRuntimeStatus: String, Hashable {
+  case stopped
+  case starting
+  case started
+  case pausing
+  case paused
+  case resuming
+  case stopping
+  case unavailable
+  case unresolved
+  case unknown
+
+  public var displayLabel: String {
+    switch self {
+    case .stopped: return "Stopped"
+    case .starting: return "Starting"
+    case .started: return "Running"
+    case .pausing: return "Pausing"
+    case .paused: return "Paused"
+    case .resuming: return "Resuming"
+    case .stopping: return "Stopping"
+    case .unavailable: return "UTM Unavailable"
+    case .unresolved: return "Unresolved"
+    case .unknown: return "Unknown"
+    }
+  }
+}
+
+public struct VMRuntimeInfo: Hashable {
+  public let status: VMRuntimeStatus
+  public let controlIdentifier: String?
+  public let detail: String?
+
+  public init(status: VMRuntimeStatus, controlIdentifier: String?, detail: String? = nil) {
+    self.status = status
+    self.controlIdentifier = controlIdentifier
+    self.detail = detail
+  }
+}

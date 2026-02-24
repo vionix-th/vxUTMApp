@@ -4,11 +4,14 @@ import Combine
 @MainActor
 final class AppViewModel: ObservableObject {
   private static let searchDirectoriesDefaultsKey = "vmSearchDirectories.v1"
+  private static let utmctlExecutablePathDefaultsKey = "utmctlExecutablePath.v1"
 
   @Published var vms: [UTMVirtualMachine] = []
   @Published var selection: Selection = .all
   @Published var snapshotTags: [SnapshotTagStatus] = []
   @Published var vmSearchDirectories: [URL] = []
+  @Published var vmRuntimeInfo: [String: VMRuntimeInfo] = [:]
+  @Published var utmctlExecutablePath: String
 
   @Published var isBusy: Bool = false
   @Published var createTag: String = AppViewModel.defaultTimestampTag()
@@ -17,8 +20,12 @@ final class AppViewModel: ObservableObject {
   @Published var logText: String = ""
   @Published var errorText: String? = nil
 
+  private var qemu: QemuImg? = nil
+  private var utmctl: UTMCtl? = nil
+
   init() {
     vmSearchDirectories = Self.loadSearchDirectories()
+    utmctlExecutablePath = Self.loadUTMCtlExecutablePath()
   }
 
   enum Selection: Hashable {
@@ -33,13 +40,36 @@ final class AppViewModel: ObservableObject {
     }
   }
 
-  private var qemu: QemuImg? = nil
-
   func bootstrap() {
     do {
       qemu = try QemuImg()
     } catch {
       errorText = error.localizedDescription
+    }
+
+    do {
+      utmctl = try UTMCtl(executableURL: resolvedUTMCtlExecutableURL())
+    } catch {
+      utmctl = nil
+      vmRuntimeInfo = [:]
+      appendLog("UTM control unavailable: ", error.localizedDescription)
+    }
+  }
+
+  private func resolvedUTMCtlExecutableURL() -> URL? {
+    let trimmed = utmctlExecutablePath.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !trimmed.isEmpty {
+      return URL(fileURLWithPath: trimmed)
+    }
+    return nil
+  }
+
+  var scopedVMs: [UTMVirtualMachine] {
+    switch selection {
+    case .all:
+      return vms
+    case .vm(let vm):
+      return [vm]
     }
   }
 
@@ -59,7 +89,6 @@ final class AppViewModel: ObservableObject {
       let discovered = try UTMDiscovery.discoverVMs(baseDirectories: vmSearchDirectories)
       vms = discovered
 
-      // Keep selection stable if possible
       switch selection {
       case .all:
         break
@@ -71,6 +100,14 @@ final class AppViewModel: ObservableObject {
         }
       }
 
+      do {
+        try await refreshRuntimeStatuses()
+      } catch {
+        appendLog("Failed to refresh runtime states: ", error.localizedDescription)
+        vmRuntimeInfo = Dictionary(uniqueKeysWithValues: vms.map {
+          ($0.id, VMRuntimeInfo(status: .unknown, controlIdentifier: nil, detail: "Status refresh failed"))
+        })
+      }
       try await refreshSnapshotTagsForCurrentSelection()
 
       if selectedTagForDelete.isEmpty {
@@ -84,37 +121,100 @@ final class AppViewModel: ObservableObject {
     }
   }
 
+  private func refreshRuntimeStatuses() async throws {
+    guard let utmctl else {
+      vmRuntimeInfo = Dictionary(uniqueKeysWithValues: vms.map {
+        ($0.id, VMRuntimeInfo(status: .unavailable, controlIdentifier: nil, detail: "utmctl not available"))
+      })
+      return
+    }
+
+    let remoteList = try await utmctl.listVirtualMachines()
+    let groupedByName = Dictionary(grouping: remoteList, by: { $0.name })
+    let groupedByNormalizedName = Dictionary(grouping: remoteList, by: { Self.normalizedVMName($0.name) })
+
+    var newRuntimeInfo: [String: VMRuntimeInfo] = [:]
+
+    for vm in vms {
+      let exactMatches = groupedByName[vm.name] ?? []
+      let normalizedMatches = groupedByNormalizedName[Self.normalizedVMName(vm.name)] ?? []
+
+      if exactMatches.count == 1 {
+        let match = exactMatches[0]
+        newRuntimeInfo[vm.id] = VMRuntimeInfo(status: match.status, controlIdentifier: match.uuid)
+        continue
+      }
+
+      if exactMatches.isEmpty && normalizedMatches.count == 1 {
+        let match = normalizedMatches[0]
+        newRuntimeInfo[vm.id] = VMRuntimeInfo(status: match.status, controlIdentifier: match.uuid, detail: "Resolved by normalized name")
+        continue
+      }
+
+      // Last-resort fallback: query status using local bundle name directly.
+      if exactMatches.isEmpty && normalizedMatches.isEmpty {
+        if let probedStatus = try await probeStatusByName(vm.name, using: utmctl) {
+          newRuntimeInfo[vm.id] = VMRuntimeInfo(status: probedStatus, controlIdentifier: vm.name, detail: "Resolved via direct name probe")
+          continue
+        }
+      }
+
+      let matches = exactMatches.isEmpty ? normalizedMatches : exactMatches
+      if matches.isEmpty {
+        newRuntimeInfo[vm.id] = VMRuntimeInfo(status: .unresolved, controlIdentifier: nil, detail: "No utmctl entry matched this VM name")
+      } else if matches.count == 1 {
+        let match = matches[0]
+        newRuntimeInfo[vm.id] = VMRuntimeInfo(status: match.status, controlIdentifier: match.uuid)
+      } else {
+        newRuntimeInfo[vm.id] = VMRuntimeInfo(status: .unresolved, controlIdentifier: nil, detail: "Multiple utmctl VMs share this name")
+      }
+    }
+
+    vmRuntimeInfo = newRuntimeInfo
+  }
+
+  private func probeStatusByName(_ name: String, using utmctl: UTMCtl) async throws -> VMRuntimeStatus? {
+    do {
+      return try await utmctl.status(identifier: name)
+    } catch let error as UTMCtlError {
+      switch error {
+      case .failed(_, _, let stderr):
+        if stderr.localizedCaseInsensitiveContains("not found") {
+          return nil
+        }
+        throw error
+      case .notFound, .invalidResponse:
+        return nil
+      }
+    } catch {
+      return nil
+    }
+  }
+
+  private static func normalizedVMName(_ input: String) -> String {
+    let lowercase = input.lowercased()
+    let scalarView = lowercase.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }
+    return String(String.UnicodeScalarView(scalarView))
+  }
+
   private func refreshSnapshotTagsForCurrentSelection() async throws {
     guard let qemu else { throw QemuImgError.notFound }
     let svc = SnapshotService(qemu: qemu)
 
-    let vmsToQuery: [UTMVirtualMachine]
-    switch selection {
-    case .all:
-      vmsToQuery = vms
-    case .vm(let vm):
-      vmsToQuery = [vm]
-    }
-
     var combinedCounts: [String: (present: Int, total: Int)] = [:]
 
-    for vm in vmsToQuery {
+    for vm in scopedVMs {
       if vm.diskURLs.isEmpty { continue }
       let statuses = try await svc.listTagStatuses(forVM: vm)
-      // For display, combine across selected VMs: present/total sums
       for st in statuses {
         let cur = combinedCounts[st.tag] ?? (present: 0, total: 0)
         combinedCounts[st.tag] = (present: cur.present + st.presentOnDiskCount, total: cur.total + st.totalDiskCount)
       }
-      // Also add tags that are missing on some disks for this VM by computing union ourselves
-      // (svc already does that per VM)
     }
 
-    let merged = combinedCounts
+    snapshotTags = combinedCounts
       .map { SnapshotTagStatus(tag: $0.key, presentOnDiskCount: $0.value.present, totalDiskCount: $0.value.total) }
       .sorted { $0.tag > $1.tag }
-
-    snapshotTags = merged
   }
 
   func createSnapshots() {
@@ -136,13 +236,7 @@ final class AppViewModel: ObservableObject {
     errorText = nil
 
     do {
-      let targets: [UTMVirtualMachine]
-      switch selection {
-      case .all: targets = vms
-      case .vm(let vm): targets = [vm]
-      }
-
-      for vm in targets {
+      for vm in scopedVMs {
         if vm.diskURLs.isEmpty { continue }
         appendLog("Creating snapshot '", tag, "' for ", vm.name)
         try await svc.createSnapshot(tag: tag, forVM: vm)
@@ -151,8 +245,6 @@ final class AppViewModel: ObservableObject {
       appendLog("Done creating '", tag, "'.")
       try await refreshSnapshotTagsForCurrentSelection()
       selectedTagForDelete = tag
-
-      // roll tag forward
       createTag = Self.defaultTimestampTag()
 
     } catch {
@@ -173,13 +265,7 @@ final class AppViewModel: ObservableObject {
     errorText = nil
 
     do {
-      let targets: [UTMVirtualMachine]
-      switch selection {
-      case .all: targets = vms
-      case .vm(let vm): targets = [vm]
-      }
-
-      for vm in targets {
+      for vm in scopedVMs {
         if vm.diskURLs.isEmpty { continue }
         appendLog("Deleting snapshot '", tag, "' for ", vm.name)
         try await svc.deleteSnapshot(tag: tag, forVM: vm)
@@ -192,6 +278,85 @@ final class AppViewModel: ObservableObject {
     } catch {
       errorText = error.localizedDescription
     }
+  }
+
+  func start(vm: UTMVirtualMachine) {
+    Task { await self.controlVMs([vm], action: .start) }
+  }
+
+  func suspend(vm: UTMVirtualMachine) {
+    Task { await self.controlVMs([vm], action: .suspend) }
+  }
+
+  func stop(vm: UTMVirtualMachine, method: UTMCtlStopMethod) {
+    Task { await self.controlVMs([vm], action: .stop(method)) }
+  }
+
+  enum VMControlAction {
+    case start
+    case suspend
+    case stop(UTMCtlStopMethod)
+
+    var logLabel: String {
+      switch self {
+      case .start:
+        return "start"
+      case .suspend:
+        return "suspend"
+      case .stop(let method):
+        return "stop (\(method.label.lowercased()))"
+      }
+    }
+  }
+
+  private func controlVMs(_ targets: [UTMVirtualMachine], action: VMControlAction) async {
+    guard let utmctl else {
+      errorText = "utmctl unavailable"
+      return
+    }
+
+    isBusy = true
+    defer { isBusy = false }
+    errorText = nil
+
+    do {
+      let infos = targets.compactMap { vm -> (UTMVirtualMachine, VMRuntimeInfo)? in
+        guard let info = vmRuntimeInfo[vm.id], let _ = info.controlIdentifier else { return nil }
+        return (vm, info)
+      }
+
+      let skipped = targets.count - infos.count
+      if skipped > 0 {
+        appendLog("Skipped \(skipped) VM(s): unresolved utmctl identifier")
+      }
+      if infos.isEmpty {
+        errorText = "No controllable VMs in selection. Check UTM Automation permission and refresh."
+        return
+      }
+
+      for (vm, info) in infos {
+        guard let identifier = info.controlIdentifier else { continue }
+        appendLog("Running \(action.logLabel) for ", vm.name)
+        switch action {
+        case .start:
+          try await utmctl.start(identifier: identifier)
+        case .suspend:
+          try await utmctl.suspend(identifier: identifier)
+        case .stop(let method):
+          try await utmctl.stop(identifier: identifier, method: method)
+        }
+      }
+
+      try await refreshRuntimeStatuses()
+      appendLog("Done: \(action.logLabel)")
+
+    } catch {
+      errorText = error.localizedDescription
+    }
+  }
+
+  func runtimeInfo(for vm: UTMVirtualMachine) -> VMRuntimeInfo {
+    vmRuntimeInfo[vm.id] ?? VMRuntimeInfo(status: .unknown, controlIdentifier: nil)
   }
 
   func appendLog(_ parts: String...) {
@@ -256,5 +421,45 @@ final class AppViewModel: ObservableObject {
     let paths = vmSearchDirectories
       .map { $0.standardizedFileURL.path }
     UserDefaults.standard.set(paths, forKey: Self.searchDirectoriesDefaultsKey)
+  }
+
+  static func loadUTMCtlExecutablePath() -> String {
+    let defaults = UserDefaults.standard
+    if let stored = defaults.string(forKey: utmctlExecutablePathDefaultsKey), !stored.isEmpty {
+      return stored
+    }
+    return UTMCtl.bundledExecutablePath
+  }
+
+  func setUTMCtlExecutableURL(_ url: URL) {
+    utmctlExecutablePath = url.standardizedFileURL.path
+    persistUTMCtlExecutablePath()
+    bootstrap()
+    refresh()
+  }
+
+  func applyUTMCtlExecutablePathFromTextField() {
+    utmctlExecutablePath = utmctlExecutablePath.trimmingCharacters(in: .whitespacesAndNewlines)
+    persistUTMCtlExecutablePath()
+    bootstrap()
+    refresh()
+  }
+
+  func useDefaultUTMCtlExecutablePath() {
+    utmctlExecutablePath = UTMCtl.bundledExecutablePath
+    persistUTMCtlExecutablePath()
+    bootstrap()
+    refresh()
+  }
+
+  func clearUTMCtlExecutablePathOverride() {
+    utmctlExecutablePath = ""
+    persistUTMCtlExecutablePath()
+    bootstrap()
+    refresh()
+  }
+
+  private func persistUTMCtlExecutablePath() {
+    UserDefaults.standard.set(utmctlExecutablePath, forKey: Self.utmctlExecutablePathDefaultsKey)
   }
 }

@@ -1,12 +1,12 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
-
 struct ContentView: View {
   @StateObject private var vm = AppViewModel()
 
   @State private var showDeleteConfirm = false
   @State private var showSettings = false
+  @State private var showErrorDetails = false
 
   var body: some View {
     NavigationSplitView {
@@ -15,12 +15,12 @@ struct ContentView: View {
           Text("All VMs").tag(AppViewModel.Selection.all)
         }
         Section("VMs") {
-          ForEach(vm.vms, id: \.self) { m in
-            Text(m.name).tag(AppViewModel.Selection.vm(m))
+          ForEach(vm.vms, id: \.self) { currentVM in
+            Text(currentVM.name).tag(AppViewModel.Selection.vm(currentVM))
           }
         }
       }
-      .navigationSplitViewColumnWidth(min: 220, ideal: 260)
+      .navigationSplitViewColumnWidth(min: 240, ideal: 280)
       .toolbar {
         ToolbarItem(placement: .automatic) {
           Button {
@@ -31,6 +31,41 @@ struct ContentView: View {
           .disabled(vm.isBusy)
         }
         ToolbarItem(placement: .automatic) {
+          if vm.errorText != nil {
+            Button {
+              showErrorDetails = true
+            } label: {
+              Label("Issue", systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            }
+            .help("Show latest error")
+            .popover(isPresented: $showErrorDetails, arrowEdge: .top) {
+              VStack(alignment: .leading, spacing: 10) {
+                Text("Latest Error")
+                  .font(.headline)
+
+                ScrollView {
+                  Text(vm.errorText ?? "")
+                    .font(.callout)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(minHeight: 140, maxHeight: 260)
+
+                HStack {
+                  Spacer()
+                  Button("Clear") {
+                    vm.errorText = nil
+                    showErrorDetails = false
+                  }
+                }
+              }
+              .padding(12)
+              .frame(width: 460)
+            }
+          }
+        }
+        ToolbarItem(placement: .automatic) {
           Button {
             showSettings = true
           } label: {
@@ -39,11 +74,15 @@ struct ContentView: View {
         }
       }
     } detail: {
-      VStack(alignment: .leading, spacing: 12) {
+      VStack(alignment: .leading, spacing: 10) {
         header
-        actions
-        snapshotList
-        logPanel
+
+        VSplitView {
+          vmRuntimePanel
+          snapshotsPanel
+          logPanel
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
       }
       .padding(12)
       .onAppear {
@@ -51,7 +90,7 @@ struct ContentView: View {
         vm.refresh()
       }
     }
-    .frame(minWidth: 900, minHeight: 600)
+    .frame(minWidth: 960, minHeight: 620)
     .sheet(isPresented: $showSettings) {
       SearchDirectoriesSettingsView(vm: vm)
     }
@@ -68,16 +107,10 @@ struct ContentView: View {
   }
 
   private var header: some View {
-    HStack(alignment: .firstTextBaseline) {
-      VStack(alignment: .leading, spacing: 4) {
-        Text(vm.selection.label)
-          .font(.title2)
-          .bold()
-
-        Text(vm.searchDirectoriesSummary)
-          .font(.subheadline)
-          .foregroundStyle(.secondary)
-      }
+    HStack(alignment: .center) {
+      Text(vm.selection.label)
+        .font(.title2)
+        .bold()
 
       Spacer()
 
@@ -88,16 +121,74 @@ struct ContentView: View {
     }
   }
 
-  private var actions: some View {
+  private var vmRuntimePanel: some View {
+    GroupBox {
+      if vm.scopedVMs.isEmpty {
+        Text("No VMs discovered.")
+          .foregroundStyle(.secondary)
+          .frame(maxWidth: .infinity, alignment: .leading)
+      } else {
+        Table(vm.scopedVMs) {
+          TableColumn("VM") { currentVM in
+            VStack(alignment: .leading, spacing: 2) {
+              Text(currentVM.name)
+              if let detail = vm.runtimeInfo(for: currentVM).detail {
+                Text(detail)
+                  .font(.caption)
+                  .foregroundStyle(.secondary)
+              }
+            }
+          }
+
+          TableColumn("Status") { currentVM in
+            RuntimeBadge(status: vm.runtimeInfo(for: currentVM).status)
+          }
+
+          TableColumn("Actions") { currentVM in
+            HStack(spacing: 6) {
+              Button {
+                vm.start(vm: currentVM)
+              } label: {
+                Image(systemName: "play.fill")
+              }
+              .help("Start")
+              .disabled(vm.isBusy || vm.runtimeInfo(for: currentVM).controlIdentifier == nil)
+
+              Button {
+                vm.suspend(vm: currentVM)
+              } label: {
+                Image(systemName: "pause.fill")
+              }
+              .help("Suspend")
+              .disabled(vm.isBusy || vm.runtimeInfo(for: currentVM).controlIdentifier == nil)
+
+              Menu {
+                Button("Graceful Shutdown") { vm.stop(vm: currentVM, method: .request) }
+                Button("Force Stop") { vm.stop(vm: currentVM, method: .force) }
+                Button("Kill", role: .destructive) { vm.stop(vm: currentVM, method: .kill) }
+              } label: {
+                Image(systemName: "power")
+              }
+              .help("Stop options")
+              .disabled(vm.isBusy || vm.runtimeInfo(for: currentVM).controlIdentifier == nil)
+            }
+          }
+        }
+        .frame(minHeight: 160, maxHeight: .infinity)
+      }
+    } label: {
+      Text("VM Runtime")
+    }
+    .frame(minHeight: 200, maxHeight: .infinity)
+  }
+
+  private var snapshotsPanel: some View {
     GroupBox {
       VStack(alignment: .leading, spacing: 10) {
         HStack(spacing: 10) {
-          Text("Create tag")
-            .frame(width: 90, alignment: .leading)
-
-          TextField("yyyy-MM-dd_HHmmss", text: $vm.createTag)
+          TextField("Snapshot tag (yyyy-MM-dd_HHmmss)", text: $vm.createTag)
             .textFieldStyle(.roundedBorder)
-            .frame(maxWidth: 260)
+            .frame(maxWidth: 300)
 
           Button {
             vm.createSnapshots()
@@ -106,21 +197,16 @@ struct ContentView: View {
           }
           .disabled(vm.isBusy)
 
-          Spacer()
-        }
+          Divider()
+            .frame(height: 18)
 
-        Divider()
-
-        HStack(spacing: 10) {
-          Text("Delete tag")
-            .frame(width: 90, alignment: .leading)
-
-          Picker("", selection: $vm.selectedTagForDelete) {
+          Picker("Tag", selection: $vm.selectedTagForDelete) {
             ForEach(vm.snapshotTags, id: \.tag) { st in
               Text(st.tag).tag(st.tag)
             }
           }
-          .frame(maxWidth: 260)
+          .labelsHidden()
+          .frame(maxWidth: 300)
 
           Button(role: .destructive) {
             showDeleteConfirm = true
@@ -137,64 +223,80 @@ struct ContentView: View {
               }
             }
           } message: {
-            Text("This will delete the snapshot tag '\(vm.selectedTagForDelete)' on every qcow2 disk in the selected scope. This cannot be undone.")
+            Text("Delete '\(vm.selectedTagForDelete)' for all qcow2 disks in this scope.")
           }
 
           Spacer()
         }
 
-        if let err = vm.errorText {
-          Divider()
-          Text(err)
-            .font(.callout)
-            .foregroundStyle(.red)
-            .textSelection(.enabled)
+        if vm.snapshotTags.isEmpty {
+          Text("No snapshots found.")
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 4)
+        } else {
+          Table(vm.snapshotTags) {
+            TableColumn("Tag") { st in
+              Text(st.tag)
+            }
+            TableColumn("State") { st in
+              switch st.consistency {
+              case .consistent:
+                Text("OK")
+              case .partial:
+                Text("Partial")
+                  .foregroundStyle(.orange)
+              }
+            }
+            TableColumn("Disks") { st in
+              Text("\(st.presentOnDiskCount)/\(st.totalDiskCount)")
+            }
+          }
+          .frame(minHeight: 130, maxHeight: .infinity)
         }
       }
       .padding(4)
     } label: {
-      Text("Actions")
-    }
-  }
-
-  private var snapshotList: some View {
-    GroupBox {
-      if vm.snapshotTags.isEmpty {
-        Text("No snapshots found (or no qcow2 disks discovered).")
-          .foregroundStyle(.secondary)
-          .frame(maxWidth: .infinity, alignment: .leading)
-      } else {
-        Table(vm.snapshotTags) {
-          TableColumn("Tag") { st in
-            Text(st.tag)
-          }
-          TableColumn("Consistency") { st in
-            switch st.consistency {
-            case .consistent:
-              Text("OK")
-            case .partial:
-              Text("PARTIAL")
-                .foregroundStyle(.orange)
-            }
-          }
-          TableColumn("Disks") { st in
-            Text("\(st.presentOnDiskCount)/\(st.totalDiskCount)")
-          }
-        }
-      }
-    } label: {
       Text("Snapshots")
     }
+    .frame(minHeight: 180, maxHeight: .infinity)
   }
 
   private var logPanel: some View {
     GroupBox {
       TextEditor(text: $vm.logText)
         .font(.system(.caption, design: .monospaced))
-        .frame(minHeight: 160)
+        .frame(minHeight: 120, maxHeight: .infinity)
     } label: {
       Text("Log")
     }
+    .frame(minHeight: 150, maxHeight: .infinity)
+  }
+}
+
+private struct RuntimeBadge: View {
+  let status: VMRuntimeStatus
+
+  private var tint: Color {
+    switch status {
+    case .started:
+      return .green
+    case .starting, .stopping, .resuming, .pausing:
+      return .orange
+    case .stopped, .paused:
+      return .gray
+    case .unavailable, .unresolved, .unknown:
+      return .red
+    }
+  }
+
+  var body: some View {
+    Text(status.displayLabel)
+      .font(.caption.weight(.semibold))
+      .padding(.horizontal, 8)
+      .padding(.vertical, 4)
+      .background(tint.opacity(0.16), in: Capsule())
+      .foregroundStyle(tint)
   }
 }
 
@@ -202,52 +304,99 @@ private struct SearchDirectoriesSettingsView: View {
   @ObservedObject var vm: AppViewModel
   @Environment(\.dismiss) private var dismiss
   @State private var isFolderImporterPresented = false
+  @State private var isUTMCtlImporterPresented = false
 
   var body: some View {
     VStack(alignment: .leading, spacing: 12) {
-      Text("VM Search Directories")
+      Text("Settings")
         .font(.title3)
         .bold()
 
-      Text("The app scans these directories for *.utm bundles. Changes persist across restarts.")
-        .foregroundStyle(.secondary)
+      GroupBox("UTM Control Binary") {
+        VStack(alignment: .leading, spacing: 8) {
+          Text("Choose the utmctl binary used for VM start/stop/status actions.")
+            .foregroundStyle(.secondary)
 
-      List {
-        ForEach(vm.vmSearchDirectories, id: \.path) { directoryURL in
-          Text(directoryURL.path)
-            .textSelection(.enabled)
-        }
-        .onDelete { offsets in
-          vm.removeSearchDirectories(at: offsets)
-          vm.refresh()
+          TextField("/Applications/UTM.app/Contents/MacOS/utmctl", text: $vm.utmctlExecutablePath)
+            .textFieldStyle(.roundedBorder)
+            .font(.system(.caption, design: .monospaced))
+
+          HStack {
+            Button {
+              vm.applyUTMCtlExecutablePathFromTextField()
+            } label: {
+              Label("Apply Path", systemImage: "checkmark")
+            }
+
+            Button {
+              isUTMCtlImporterPresented = true
+            } label: {
+              Label("Choose Binary", systemImage: "folder")
+            }
+
+            Button {
+              vm.useDefaultUTMCtlExecutablePath()
+            } label: {
+              Label("Use UTM.app Default", systemImage: "arrow.uturn.backward")
+            }
+
+            Button {
+              vm.clearUTMCtlExecutablePathOverride()
+            } label: {
+              Label("Clear Override", systemImage: "xmark.circle")
+            }
+
+            Spacer()
+          }
         }
       }
-      .frame(minHeight: 220)
+
+      GroupBox("VM Search Directories") {
+        VStack(alignment: .leading, spacing: 8) {
+          Text("The app scans these directories for *.utm bundles. Changes persist across restarts.")
+            .foregroundStyle(.secondary)
+
+          List {
+            ForEach(vm.vmSearchDirectories, id: \.path) { directoryURL in
+              Text(directoryURL.path)
+                .textSelection(.enabled)
+            }
+            .onDelete { offsets in
+              vm.removeSearchDirectories(at: offsets)
+              vm.refresh()
+            }
+          }
+          .frame(minHeight: 220)
+
+          HStack {
+            Button {
+              isFolderImporterPresented = true
+            } label: {
+              Label("Add Directory", systemImage: "plus")
+            }
+
+            Button(role: .destructive) {
+              vm.clearSearchDirectories()
+              vm.refresh()
+            } label: {
+              Label("Clear All", systemImage: "trash")
+            }
+            .disabled(vm.vmSearchDirectories.isEmpty)
+
+            Spacer()
+          }
+        }
+      }
 
       HStack {
-        Button {
-          isFolderImporterPresented = true
-        } label: {
-          Label("Add Directory", systemImage: "plus")
-        }
-
-        Button(role: .destructive) {
-          vm.clearSearchDirectories()
-          vm.refresh()
-        } label: {
-          Label("Clear All", systemImage: "trash")
-        }
-        .disabled(vm.vmSearchDirectories.isEmpty)
-
         Spacer()
-
         Button("Done") {
           dismiss()
         }
       }
     }
     .padding(16)
-    .frame(minWidth: 680, minHeight: 360)
+    .frame(minWidth: 760, minHeight: 460)
     .fileImporter(
       isPresented: $isFolderImporterPresented,
       allowedContentTypes: [.folder],
@@ -258,6 +407,14 @@ private struct SearchDirectoriesSettingsView: View {
         vm.addSearchDirectory(url)
       }
       vm.refresh()
+    }
+    .fileImporter(
+      isPresented: $isUTMCtlImporterPresented,
+      allowedContentTypes: [.unixExecutable, .data],
+      allowsMultipleSelection: false
+    ) { result in
+      guard case .success(let urls) = result, let first = urls.first else { return }
+      vm.setUTMCtlExecutableURL(first)
     }
   }
 }
