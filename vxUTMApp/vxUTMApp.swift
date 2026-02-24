@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct UTMSnapshotsApp: App {
+struct vxUTMApp: App {
   var body: some Scene {
     WindowGroup {
       ContentView()

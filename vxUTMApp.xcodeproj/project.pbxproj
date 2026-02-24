@@ -7,13 +7,13 @@
 	objects = {
 
 /* Begin PBXFileReference section */
-		741FB13D2F4DAB85008A93D6 /* UTMSnapshotsApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = UTMSnapshotsApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		741FB13D2F4DAB85008A93D6 /* vxUTMApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = vxUTMApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
-		741FB13F2F4DAB85008A93D6 /* UTMSnapshotsApp */ = {
+		741FB13F2F4DAB85008A93D6 /* vxUTMApp */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			path = UTMSnapshotsApp;
+			path = vxUTMApp;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -32,7 +32,7 @@
 		741FB1342F4DAB85008A93D6 = {
 			isa = PBXGroup;
 			children = (
-				741FB13F2F4DAB85008A93D6 /* UTMSnapshotsApp */,
+				741FB13F2F4DAB85008A93D6 /* vxUTMApp */,
 				741FB13E2F4DAB85008A93D6 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -40,7 +40,7 @@
 		741FB13E2F4DAB85008A93D6 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				741FB13D2F4DAB85008A93D6 /* UTMSnapshotsApp.app */,
+				741FB13D2F4DAB85008A93D6 /* vxUTMApp.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -48,9 +48,9 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		741FB13C2F4DAB85008A93D6 /* UTMSnapshotsApp */ = {
+		741FB13C2F4DAB85008A93D6 /* vxUTMApp */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 741FB1602F4DAB86008A93D6 /* Build configuration list for PBXNativeTarget "UTMSnapshotsApp" */;
+			buildConfigurationList = 741FB1602F4DAB86008A93D6 /* Build configuration list for PBXNativeTarget "vxUTMApp" */;
 			buildPhases = (
 				741FB1392F4DAB85008A93D6 /* Sources */,
 				741FB13A2F4DAB85008A93D6 /* Frameworks */,
@@ -61,13 +61,13 @@
 			dependencies = (
 			);
 			fileSystemSynchronizedGroups = (
-				741FB13F2F4DAB85008A93D6 /* UTMSnapshotsApp */,
+				741FB13F2F4DAB85008A93D6 /* vxUTMApp */,
 			);
-			name = UTMSnapshotsApp;
+			name = vxUTMApp;
 			packageProductDependencies = (
 			);
-			productName = UTMSnapshotsApp;
-			productReference = 741FB13D2F4DAB85008A93D6 /* UTMSnapshotsApp.app */;
+			productName = vxUTMApp;
+			productReference = 741FB13D2F4DAB85008A93D6 /* vxUTMApp.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -85,7 +85,7 @@
 					};
 				};
 			};
-			buildConfigurationList = 741FB1382F4DAB85008A93D6 /* Build configuration list for PBXProject "UTMSnapshotsApp" */;
+			buildConfigurationList = 741FB1382F4DAB85008A93D6 /* Build configuration list for PBXProject "vxUTMApp" */;
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
 			knownRegions = (
@@ -99,7 +99,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				741FB13C2F4DAB85008A93D6 /* UTMSnapshotsApp */,
+				741FB13C2F4DAB85008A93D6 /* vxUTMApp */,
 			);
 		};
 /* End PBXProject section */
@@ -254,7 +254,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_CFBundleDisplayName = "UTM Snapshot App";
+				INFOPLIST_KEY_CFBundleDisplayName = "vxUTMApp";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
@@ -271,7 +271,7 @@
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 26.2;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.vionix.UTMSnapshotsApp;
+				PRODUCT_BUNDLE_IDENTIFIER = com.vionix.vxUTMApp;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;
@@ -300,7 +300,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_CFBundleDisplayName = "UTM Snapshot App";
+				INFOPLIST_KEY_CFBundleDisplayName = "vxUTMApp";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
@@ -317,7 +317,7 @@
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 26.2;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.vionix.UTMSnapshotsApp;
+				PRODUCT_BUNDLE_IDENTIFIER = com.vionix.vxUTMApp;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;
@@ -336,7 +336,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		741FB1382F4DAB85008A93D6 /* Build configuration list for PBXProject "UTMSnapshotsApp" */ = {
+		741FB1382F4DAB85008A93D6 /* Build configuration list for PBXProject "vxUTMApp" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				741FB15E2F4DAB86008A93D6 /* Debug */,
@@ -345,7 +345,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		741FB1602F4DAB86008A93D6 /* Build configuration list for PBXNativeTarget "UTMSnapshotsApp" */ = {
+		741FB1602F4DAB86008A93D6 /* Build configuration list for PBXNativeTarget "vxUTMApp" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				741FB1612F4DAB86008A93D6 /* Debug */,
