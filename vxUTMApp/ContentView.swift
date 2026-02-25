@@ -2,7 +2,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct ContentView: View {
-  @StateObject private var vm = AppViewModel()
+  @StateObject private var vm: AppViewModel
 
   @State private var showDeleteConfirm = false
   @State private var showSettings = false
@@ -10,6 +10,10 @@ struct ContentView: View {
   @State private var showLogViewer = false
   @State private var showShutdownAllConfirm = false
   @State private var pendingShutdownAllMethod: UTMCtlStopMethod = .request
+
+  @MainActor init(vm: AppViewModel) {
+    _vm = StateObject(wrappedValue: vm)
+  }
 
   var body: some View {
     NavigationSplitView {
@@ -117,6 +121,7 @@ struct ContentView: View {
     } detail: {
       VStack(alignment: .leading, spacing: 10) {
         header
+        backupProgressPanel
 
         VSplitView {
           vmRuntimePanel
@@ -155,8 +160,8 @@ struct ContentView: View {
 
       Spacer()
 
-      if case .all = vm.selection {
-        HStack(spacing: 8) {
+      HStack(spacing: 8) {
+        if case .all = vm.selection {
           Button {
             vm.startAllInScope()
           } label: {
@@ -190,11 +195,68 @@ struct ContentView: View {
             Text("Applies '\(pendingShutdownAllMethod.label)' to all controllable VMs in current scope.")
           }
         }
+
+        Button {
+          vm.backupScope()
+        } label: {
+          Label("Backup Scope", systemImage: "archivebox")
+        }
+        .disabled(!vm.canRunBackup)
+        .help(vm.backupBlockedReason ?? "Create one ZIP backup per VM in current scope.")
       }
 
       if vm.isBusy {
         ProgressView()
           .controlSize(.small)
+      }
+    }
+  }
+
+  private var backupProgressPanel: some View {
+    Group {
+      if vm.hasBackupJobs || vm.isBackingUp {
+        GroupBox("Backups") {
+          VStack(alignment: .leading, spacing: 8) {
+            HStack {
+              Text(vm.backupProgressSummary)
+                .font(.subheadline)
+              if vm.canAbortBackup {
+                Button(role: .destructive) {
+                  vm.abortBackup()
+                } label: {
+                  Label("Abort Backup", systemImage: "xmark.circle")
+                }
+                .controlSize(.small)
+              }
+              Spacer()
+            }
+
+            if let progress = vm.backupOverallProgress {
+              ProgressView(value: progress)
+            } else if vm.isBackingUp {
+              ProgressView()
+            }
+
+            ForEach(vm.backupJobs.prefix(6), id: \.id) { job in
+              VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                  Text(job.vmName)
+                    .frame(width: 220, alignment: .leading)
+                  Text(job.state.displayLabel)
+                    .font(.caption)
+                    .foregroundStyle(job.state == .failed ? .red : .secondary)
+                  Text(job.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                  Spacer()
+                }
+                ProgressView(value: job.progress)
+              }
+            }
+          }
+          .frame(maxWidth: .infinity, alignment: .leading)
+        }
       }
     }
   }
@@ -386,6 +448,7 @@ private struct SearchDirectoriesSettingsView: View {
   private enum ImportTarget {
     case directory
     case utmctl
+    case backupDirectory
   }
 
   @ObservedObject var vm: AppViewModel
@@ -477,6 +540,40 @@ private struct SearchDirectoriesSettingsView: View {
         }
       }
 
+      GroupBox("Backup Directory") {
+        VStack(alignment: .leading, spacing: 8) {
+          Text("Backups create one ZIP archive per VM in scope in this directory.")
+            .foregroundStyle(.secondary)
+
+          TextField("/Users/.../Documents/vxUTMBackups", text: $vm.backupDirectoryPath)
+            .textFieldStyle(.roundedBorder)
+            .font(.system(.caption, design: .monospaced))
+
+          HStack {
+            Button {
+              vm.applyBackupDirectoryPathFromTextField()
+            } label: {
+              Label("Apply Path", systemImage: "checkmark")
+            }
+
+            Button {
+              importTarget = .backupDirectory
+              isImporterPresented = true
+            } label: {
+              Label("Choose Directory", systemImage: "folder")
+            }
+
+            Button {
+              vm.useDefaultBackupDirectory()
+            } label: {
+              Label("Use Default", systemImage: "arrow.uturn.backward")
+            }
+
+            Spacer()
+          }
+        }
+      }
+
       HStack {
         Spacer()
         Button("Done") {
@@ -501,6 +598,9 @@ private struct SearchDirectoriesSettingsView: View {
       case .utmctl:
         guard let first = urls.first else { return }
         vm.setUTMCtlExecutableURL(first)
+      case .backupDirectory:
+        guard let first = urls.first else { return }
+        vm.setBackupDirectoryURL(first)
       }
     }
   }
@@ -511,6 +611,8 @@ private struct SearchDirectoriesSettingsView: View {
       return [.folder]
     case .utmctl:
       return [.unixExecutable, .data]
+    case .backupDirectory:
+      return [.folder]
     }
   }
 
@@ -519,6 +621,8 @@ private struct SearchDirectoriesSettingsView: View {
     case .directory:
       return true
     case .utmctl:
+      return false
+    case .backupDirectory:
       return false
     }
   }

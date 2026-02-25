@@ -14,12 +14,6 @@ public enum QemuImgError: Error, LocalizedError {
   }
 }
 
-public struct ProcessResult: Sendable {
-  public let code: Int32
-  public let stdout: String
-  public let stderr: String
-}
-
 public actor QemuImg {
   public static func resolveExecutableURL() -> URL? {
     let fm = FileManager.default
@@ -41,8 +35,10 @@ public actor QemuImg {
   }
 
   private let exeURL: URL
+  private let processExecutor: any ProcessExecuting
 
-  public init(executableURL: URL? = nil) throws {
+  public init(executableURL: URL? = nil, processExecutor: any ProcessExecuting = ProcessExecutor()) throws {
+    self.processExecutor = processExecutor
     if let u = executableURL {
       self.exeURL = u
       return
@@ -52,27 +48,7 @@ public actor QemuImg {
   }
 
   public func run(_ args: [String]) async throws -> ProcessResult {
-    let p = Process()
-    p.executableURL = exeURL
-    p.arguments = args
-
-    let outPipe = Pipe()
-    let errPipe = Pipe()
-    p.standardOutput = outPipe
-    p.standardError = errPipe
-
-    try p.run()
-
-    // Read to end while it runs (simple + reliable for our output sizes)
-    let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-
-    p.waitUntilExit()
-
-    let stdout = String(data: outData, encoding: .utf8) ?? ""
-    let stderr = String(data: errData, encoding: .utf8) ?? ""
-
-    return ProcessResult(code: p.terminationStatus, stdout: stdout, stderr: stderr)
+    try await processExecutor.run(executableURL: exeURL, arguments: args, cancellationToken: nil)
   }
 
   public func snapshotList(diskURL: URL) async throws -> String {

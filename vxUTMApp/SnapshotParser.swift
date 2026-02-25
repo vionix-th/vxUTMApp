@@ -6,7 +6,7 @@ public enum SnapshotParser {
   // Snapshot list:
   // ID TAG VM_SIZE DATE VM_CLOCK ICOUNT
   // 1  tag  0 B 2026-02-10 18:38:21  0000:00:00.000 0
-  public static func parseSnapshotList(_ text: String) -> [QemuSnapshotEntry] {
+  public nonisolated static func parseSnapshotList(_ text: String) -> [QemuSnapshotEntry] {
     let lines = text
       .split(whereSeparator: \.isNewline)
       .map(String.init)

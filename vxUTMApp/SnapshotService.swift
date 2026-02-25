@@ -3,16 +3,16 @@ import Foundation
 public struct SnapshotService {
   private let qemu: QemuImg
 
-  public init(qemu: QemuImg) {
+  public nonisolated init(qemu: QemuImg) {
     self.qemu = qemu
   }
 
-  public func listSnapshotEntries(forDisk diskURL: URL) async throws -> [QemuSnapshotEntry] {
+  public nonisolated func listSnapshotEntries(forDisk diskURL: URL) async throws -> [QemuSnapshotEntry] {
     let out = try await qemu.snapshotList(diskURL: diskURL)
     return SnapshotParser.parseSnapshotList(out)
   }
 
-  public func listTagStatuses(forVM vm: UTMVirtualMachine) async throws -> [SnapshotTagStatus] {
+  public nonisolated func listTagStatuses(forVM vm: UTMVirtualMachine) async throws -> [SnapshotTagStatus] {
     var tagToCount: [String: Int] = [:]
     let total = vm.diskURLs.count
 
@@ -31,13 +31,13 @@ public struct SnapshotService {
     return statuses
   }
 
-  public func createSnapshot(tag: String, forVM vm: UTMVirtualMachine) async throws {
+  public nonisolated func createSnapshot(tag: String, forVM vm: UTMVirtualMachine) async throws {
     for disk in vm.diskURLs {
       try await qemu.snapshotCreate(tag: tag, diskURL: disk)
     }
   }
 
-  public func deleteSnapshot(tag: String, forVM vm: UTMVirtualMachine) async throws {
+  public nonisolated func deleteSnapshot(tag: String, forVM vm: UTMVirtualMachine) async throws {
     for disk in vm.diskURLs {
       try await qemu.snapshotDelete(tag: tag, diskURL: disk)
     }

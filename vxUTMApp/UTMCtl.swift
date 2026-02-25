@@ -71,8 +71,10 @@ public actor UTMCtl {
   }
 
   private let executableURL: URL
+  private let processExecutor: any ProcessExecuting
 
-  public init(executableURL: URL? = nil) throws {
+  public init(executableURL: URL? = nil, processExecutor: any ProcessExecuting = ProcessExecutor()) throws {
+    self.processExecutor = processExecutor
     if let executableURL {
       self.executableURL = executableURL
       return
@@ -84,24 +86,7 @@ public actor UTMCtl {
   }
 
   public func run(_ args: [String]) async throws -> ProcessResult {
-    let process = Process()
-    process.executableURL = executableURL
-    process.arguments = args
-
-    let outPipe = Pipe()
-    let errPipe = Pipe()
-    process.standardOutput = outPipe
-    process.standardError = errPipe
-
-    try process.run()
-
-    let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-    process.waitUntilExit()
-
-    let stdout = String(data: outData, encoding: .utf8) ?? ""
-    let stderr = String(data: errData, encoding: .utf8) ?? ""
-    return ProcessResult(code: process.terminationStatus, stdout: stdout, stderr: stderr)
+    try await processExecutor.run(executableURL: executableURL, arguments: args, cancellationToken: nil)
   }
 
   public func listVirtualMachines() async throws -> [UTMCtlVirtualMachine] {
