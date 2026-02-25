@@ -7,6 +7,9 @@ struct ContentView: View {
   @State private var showDeleteConfirm = false
   @State private var showSettings = false
   @State private var showErrorDetails = false
+  @State private var showLogViewer = false
+  @State private var showShutdownAllConfirm = false
+  @State private var pendingShutdownAllMethod: UTMCtlStopMethod = .request
 
   var body: some View {
     NavigationSplitView {
@@ -67,6 +70,44 @@ struct ContentView: View {
         }
         ToolbarItem(placement: .automatic) {
           Button {
+            showLogViewer = true
+          } label: {
+            Label("Log", systemImage: "text.alignleft")
+          }
+          .help("Show activity log")
+          .popover(isPresented: $showLogViewer, arrowEdge: .top) {
+            VStack(alignment: .leading, spacing: 10) {
+              Text("Activity Log")
+                .font(.headline)
+
+              if vm.logText.isEmpty {
+                Text("No log entries yet.")
+                  .foregroundStyle(.secondary)
+                  .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+              } else {
+                ScrollView {
+                  Text(vm.logText)
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(minHeight: 180, maxHeight: 320)
+              }
+
+              HStack {
+                Button("Clear") {
+                  vm.logText = ""
+                }
+                .disabled(vm.logText.isEmpty)
+                Spacer()
+              }
+            }
+            .padding(12)
+            .frame(width: 500)
+          }
+        }
+        ToolbarItem(placement: .automatic) {
+          Button {
             showSettings = true
           } label: {
             Label("Settings", systemImage: "gearshape")
@@ -80,11 +121,11 @@ struct ContentView: View {
         VSplitView {
           vmRuntimePanel
           snapshotsPanel
-          logPanel
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipped()
       }
-      .padding(12)
+      .padding()
       .onAppear {
         vm.bootstrap()
         vm.refresh()
@@ -114,6 +155,43 @@ struct ContentView: View {
 
       Spacer()
 
+      if case .all = vm.selection {
+        HStack(spacing: 8) {
+          Button {
+            vm.startAllInScope()
+          } label: {
+            Label("Start All", systemImage: "play.fill")
+          }
+          .disabled(vm.isBusy || !vm.hasControllableScopedVMs)
+
+          Menu {
+            Button("Graceful Shutdown") {
+              pendingShutdownAllMethod = .request
+              showShutdownAllConfirm = true
+            }
+            Button("Force Stop") {
+              pendingShutdownAllMethod = .force
+              showShutdownAllConfirm = true
+            }
+            Button("Kill", role: .destructive) {
+              pendingShutdownAllMethod = .kill
+              showShutdownAllConfirm = true
+            }
+          } label: {
+            Label("Shutdown All", systemImage: "power")
+          }
+          .disabled(vm.isBusy || !vm.hasControllableScopedVMs)
+          .alert("Shutdown all VMs?", isPresented: $showShutdownAllConfirm) {
+            Button("Cancel", role: .cancel) {}
+            Button("Continue", role: .destructive) {
+              vm.shutdownAllInScope(method: pendingShutdownAllMethod)
+            }
+          } message: {
+            Text("Applies '\(pendingShutdownAllMethod.label)' to all controllable VMs in current scope.")
+          }
+        }
+      }
+
       if vm.isBusy {
         ProgressView()
           .controlSize(.small)
@@ -123,63 +201,68 @@ struct ContentView: View {
 
   private var vmRuntimePanel: some View {
     GroupBox {
-      if vm.scopedVMs.isEmpty {
-        Text("No VMs discovered.")
-          .foregroundStyle(.secondary)
-          .frame(maxWidth: .infinity, alignment: .leading)
-      } else {
-        Table(vm.scopedVMs) {
-          TableColumn("VM") { currentVM in
-            VStack(alignment: .leading, spacing: 2) {
-              Text(currentVM.name)
-              if let detail = vm.runtimeInfo(for: currentVM).detail {
-                Text(detail)
-                  .font(.caption)
-                  .foregroundStyle(.secondary)
+      VStack(alignment: .leading, spacing: 8) {
+        if vm.scopedVMs.isEmpty {
+          Text("No VMs discovered.")
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+          Table(vm.scopedVMs) {
+            TableColumn("VM") { currentVM in
+              VStack(alignment: .leading, spacing: 2) {
+                Text(currentVM.name)
+                if let detail = vm.runtimeInfo(for: currentVM).detail {
+                  Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+              }
+            }
+
+            TableColumn("Status") { currentVM in
+              RuntimeBadge(status: vm.runtimeInfo(for: currentVM).status)
+            }
+
+            TableColumn("Actions") { currentVM in
+              HStack(spacing: 6) {
+                Button {
+                  vm.start(vm: currentVM)
+                } label: {
+                  Image(systemName: "play.fill")
+                }
+                .help("Start")
+                .disabled(vm.isBusy || vm.runtimeInfo(for: currentVM).controlIdentifier == nil)
+
+                Button {
+                  vm.suspend(vm: currentVM)
+                } label: {
+                  Image(systemName: "pause.fill")
+                }
+                .help("Suspend")
+                .disabled(vm.isBusy || vm.runtimeInfo(for: currentVM).controlIdentifier == nil)
+
+                Menu {
+                  Button("Graceful Shutdown") { vm.stop(vm: currentVM, method: .request) }
+                  Button("Force Stop") { vm.stop(vm: currentVM, method: .force) }
+                  Button("Kill", role: .destructive) { vm.stop(vm: currentVM, method: .kill) }
+                } label: {
+                  Image(systemName: "power")
+                }
+                .help("Stop options")
+                .disabled(vm.isBusy || vm.runtimeInfo(for: currentVM).controlIdentifier == nil)
               }
             }
           }
-
-          TableColumn("Status") { currentVM in
-            RuntimeBadge(status: vm.runtimeInfo(for: currentVM).status)
-          }
-
-          TableColumn("Actions") { currentVM in
-            HStack(spacing: 6) {
-              Button {
-                vm.start(vm: currentVM)
-              } label: {
-                Image(systemName: "play.fill")
-              }
-              .help("Start")
-              .disabled(vm.isBusy || vm.runtimeInfo(for: currentVM).controlIdentifier == nil)
-
-              Button {
-                vm.suspend(vm: currentVM)
-              } label: {
-                Image(systemName: "pause.fill")
-              }
-              .help("Suspend")
-              .disabled(vm.isBusy || vm.runtimeInfo(for: currentVM).controlIdentifier == nil)
-
-              Menu {
-                Button("Graceful Shutdown") { vm.stop(vm: currentVM, method: .request) }
-                Button("Force Stop") { vm.stop(vm: currentVM, method: .force) }
-                Button("Kill", role: .destructive) { vm.stop(vm: currentVM, method: .kill) }
-              } label: {
-                Image(systemName: "power")
-              }
-              .help("Stop options")
-              .disabled(vm.isBusy || vm.runtimeInfo(for: currentVM).controlIdentifier == nil)
-            }
-          }
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(minHeight: 160, maxHeight: .infinity)
+
+        Spacer(minLength: 0)
       }
+      .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     } label: {
       Text("VM Runtime")
     }
-    .frame(minHeight: 200, maxHeight: .infinity)
+    .frame(minHeight: 220, maxHeight: .infinity)
   }
 
   private var snapshotsPanel: some View {
@@ -195,7 +278,7 @@ struct ContentView: View {
           } label: {
             Label("Create", systemImage: "plus.circle")
           }
-          .disabled(vm.isBusy)
+          .disabled(vm.isBusy || !vm.canMutateSnapshots)
 
           Divider()
             .frame(height: 18)
@@ -213,7 +296,7 @@ struct ContentView: View {
           } label: {
             Label("Delete", systemImage: "trash")
           }
-          .disabled(vm.isBusy || vm.selectedTagForDelete.isEmpty)
+          .disabled(vm.isBusy || vm.selectedTagForDelete.isEmpty || !vm.canMutateSnapshots)
           .alert("Delete snapshot?", isPresented: $showDeleteConfirm) {
             Button("Cancel", role: .cancel) {}
             Button("Delete", role: .destructive) {
@@ -227,6 +310,13 @@ struct ContentView: View {
           }
 
           Spacer()
+        }
+
+        if let blockedReason = vm.snapshotMutationBlockedReason {
+          Text(blockedReason)
+            .font(.caption)
+            .foregroundStyle(.orange)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
 
         if vm.snapshotTags.isEmpty {
@@ -252,26 +342,18 @@ struct ContentView: View {
               Text("\(st.presentOnDiskCount)/\(st.totalDiskCount)")
             }
           }
-          .frame(minHeight: 130, maxHeight: .infinity)
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+
+        Spacer(minLength: 0)
       }
-      .padding(4)
+      .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     } label: {
       Text("Snapshots")
     }
-    .frame(minHeight: 180, maxHeight: .infinity)
+    .frame(minHeight: 220, maxHeight: .infinity)
   }
 
-  private var logPanel: some View {
-    GroupBox {
-      TextEditor(text: $vm.logText)
-        .font(.system(.caption, design: .monospaced))
-        .frame(minHeight: 120, maxHeight: .infinity)
-    } label: {
-      Text("Log")
-    }
-    .frame(minHeight: 150, maxHeight: .infinity)
-  }
 }
 
 private struct RuntimeBadge: View {
@@ -301,10 +383,15 @@ private struct RuntimeBadge: View {
 }
 
 private struct SearchDirectoriesSettingsView: View {
+  private enum ImportTarget {
+    case directory
+    case utmctl
+  }
+
   @ObservedObject var vm: AppViewModel
   @Environment(\.dismiss) private var dismiss
-  @State private var isFolderImporterPresented = false
-  @State private var isUTMCtlImporterPresented = false
+  @State private var isImporterPresented = false
+  @State private var importTarget: ImportTarget = .directory
 
   var body: some View {
     VStack(alignment: .leading, spacing: 12) {
@@ -329,7 +416,8 @@ private struct SearchDirectoriesSettingsView: View {
             }
 
             Button {
-              isUTMCtlImporterPresented = true
+              importTarget = .utmctl
+              isImporterPresented = true
             } label: {
               Label("Choose Binary", systemImage: "folder")
             }
@@ -370,7 +458,8 @@ private struct SearchDirectoriesSettingsView: View {
 
           HStack {
             Button {
-              isFolderImporterPresented = true
+              importTarget = .directory
+              isImporterPresented = true
             } label: {
               Label("Add Directory", systemImage: "plus")
             }
@@ -398,23 +487,39 @@ private struct SearchDirectoriesSettingsView: View {
     .padding(16)
     .frame(minWidth: 760, minHeight: 460)
     .fileImporter(
-      isPresented: $isFolderImporterPresented,
-      allowedContentTypes: [.folder],
-      allowsMultipleSelection: true
+      isPresented: $isImporterPresented,
+      allowedContentTypes: importerAllowedContentTypes,
+      allowsMultipleSelection: importerAllowsMultipleSelection
     ) { result in
       guard case .success(let urls) = result else { return }
-      for url in urls {
-        vm.addSearchDirectory(url)
+      switch importTarget {
+      case .directory:
+        for directoryURL in urls {
+          vm.addSearchDirectory(directoryURL)
+        }
+        vm.refresh()
+      case .utmctl:
+        guard let first = urls.first else { return }
+        vm.setUTMCtlExecutableURL(first)
       }
-      vm.refresh()
     }
-    .fileImporter(
-      isPresented: $isUTMCtlImporterPresented,
-      allowedContentTypes: [.unixExecutable, .data],
-      allowsMultipleSelection: false
-    ) { result in
-      guard case .success(let urls) = result, let first = urls.first else { return }
-      vm.setUTMCtlExecutableURL(first)
+  }
+
+  private var importerAllowedContentTypes: [UTType] {
+    switch importTarget {
+    case .directory:
+      return [.folder]
+    case .utmctl:
+      return [.unixExecutable, .data]
+    }
+  }
+
+  private var importerAllowsMultipleSelection: Bool {
+    switch importTarget {
+    case .directory:
+      return true
+    case .utmctl:
+      return false
     }
   }
 }

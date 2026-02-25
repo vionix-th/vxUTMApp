@@ -4,6 +4,7 @@ import Combine
 @MainActor
 final class AppViewModel: ObservableObject {
   private static let searchDirectoriesDefaultsKey = "vmSearchDirectories.v1"
+  private static let searchDirectoryBookmarksDefaultsKey = "vmSearchDirectories.bookmarks.v1"
   private static let utmctlExecutablePathDefaultsKey = "utmctlExecutablePath.v1"
 
   @Published var vms: [UTMVirtualMachine] = []
@@ -22,10 +23,21 @@ final class AppViewModel: ObservableObject {
 
   private var qemu: QemuImg? = nil
   private var utmctl: UTMCtl? = nil
+  private var searchDirectoryBookmarksByPath: [String: Data] = [:]
+  private var activeSecurityScopedDirectoryURLsByPath: [String: URL] = [:]
 
   init() {
-    vmSearchDirectories = Self.loadSearchDirectories()
+    let loadedDirectories = Self.loadSearchDirectories()
+    vmSearchDirectories = loadedDirectories.directories
+    searchDirectoryBookmarksByPath = loadedDirectories.bookmarksByPath
     utmctlExecutablePath = Self.loadUTMCtlExecutablePath()
+    restoreSecurityScopedDirectoryAccess()
+  }
+
+  deinit {
+    for (_, activeURL) in activeSecurityScopedDirectoryURLsByPath {
+      activeURL.stopAccessingSecurityScopedResource()
+    }
   }
 
   enum Selection: Hashable {
@@ -73,6 +85,31 @@ final class AppViewModel: ObservableObject {
     }
   }
 
+  var snapshotMutationBlockedReason: String? {
+    guard utmctl != nil else {
+      return "Snapshot create/delete requires utmctl so runtime state can be verified as stopped."
+    }
+
+    let targetVMs = scopedVMs.filter { !$0.diskURLs.isEmpty }
+    if targetVMs.isEmpty {
+      return "No qcow2 disks in current scope."
+    }
+
+    let nonStopped = targetVMs.filter { runtimeInfo(for: $0).status != .stopped }
+    if nonStopped.isEmpty {
+      return nil
+    }
+
+    let labels = nonStopped.map { vm in
+      "\(vm.name) (\(runtimeInfo(for: vm).status.displayLabel))"
+    }
+    return "Stop all scoped VMs before snapshot changes. Non-stopped: " + labels.joined(separator: ", ")
+  }
+
+  var canMutateSnapshots: Bool {
+    snapshotMutationBlockedReason == nil
+  }
+
   func refresh() {
     Task {
       await self._refresh()
@@ -86,29 +123,29 @@ final class AppViewModel: ObservableObject {
     errorText = nil
 
     do {
-      let discovered = try UTMDiscovery.discoverVMs(baseDirectories: vmSearchDirectories)
-      vms = discovered
+      let discoveredBundles = try UTMDiscovery.discoverBundles(baseDirectories: vmSearchDirectories)
+      let oldSelectionID = selectedVMID
 
-      switch selection {
-      case .all:
-        break
-      case .vm(let old):
-        if let new = discovered.first(where: { $0.bundleURL == old.bundleURL }) {
-          selection = .vm(new)
-        } else {
-          selection = .all
+      if let utmctl {
+        let remoteList = try await utmctl.listVirtualMachines()
+        rebuildVMInventory(fromUTMCtlList: remoteList, discoveredBundles: discoveredBundles)
+      } else {
+        vms = discoveredBundles.map { bundle in
+          UTMVirtualMachine(
+            controlIdentifier: nil,
+            name: bundle.name,
+            bundleURL: bundle.bundleURL,
+            diskURLs: bundle.diskURLs
+          )
         }
-      }
-
-      do {
-        try await refreshRuntimeStatuses()
-      } catch {
-        appendLog("Failed to refresh runtime states: ", error.localizedDescription)
         vmRuntimeInfo = Dictionary(uniqueKeysWithValues: vms.map {
-          ($0.id, VMRuntimeInfo(status: .unknown, controlIdentifier: nil, detail: "Status refresh failed"))
+          ($0.id, VMRuntimeInfo(status: .unavailable, controlIdentifier: nil, detail: "utmctl not available"))
         })
       }
-      try await refreshSnapshotTagsForCurrentSelection()
+
+      restoreSelection(from: oldSelectionID)
+
+      await refreshSnapshotTagsForCurrentSelection()
 
       if selectedTagForDelete.isEmpty {
         selectedTagForDelete = snapshotTags.first?.tag ?? ""
@@ -129,92 +166,45 @@ final class AppViewModel: ObservableObject {
       return
     }
 
+    let discoveredBundles = try UTMDiscovery.discoverBundles(baseDirectories: vmSearchDirectories)
+    let oldSelectionID = selectedVMID
     let remoteList = try await utmctl.listVirtualMachines()
-    let groupedByName = Dictionary(grouping: remoteList, by: { $0.name })
-    let groupedByNormalizedName = Dictionary(grouping: remoteList, by: { Self.normalizedVMName($0.name) })
+    rebuildVMInventory(fromUTMCtlList: remoteList, discoveredBundles: discoveredBundles)
+    restoreSelection(from: oldSelectionID)
+  }
 
-    var newRuntimeInfo: [String: VMRuntimeInfo] = [:]
-
-    for vm in vms {
-      let exactMatches = groupedByName[vm.name] ?? []
-      let normalizedMatches = groupedByNormalizedName[Self.normalizedVMName(vm.name)] ?? []
-
-      if exactMatches.count == 1 {
-        let match = exactMatches[0]
-        newRuntimeInfo[vm.id] = VMRuntimeInfo(status: match.status, controlIdentifier: match.uuid)
-        continue
-      }
-
-      if exactMatches.isEmpty && normalizedMatches.count == 1 {
-        let match = normalizedMatches[0]
-        newRuntimeInfo[vm.id] = VMRuntimeInfo(status: match.status, controlIdentifier: match.uuid, detail: "Resolved by normalized name")
-        continue
-      }
-
-      // Last-resort fallback: query status using local bundle name directly.
-      if exactMatches.isEmpty && normalizedMatches.isEmpty {
-        if let probedStatus = try await probeStatusByName(vm.name, using: utmctl) {
-          newRuntimeInfo[vm.id] = VMRuntimeInfo(status: probedStatus, controlIdentifier: vm.name, detail: "Resolved via direct name probe")
-          continue
-        }
-      }
-
-      let matches = exactMatches.isEmpty ? normalizedMatches : exactMatches
-      if matches.isEmpty {
-        newRuntimeInfo[vm.id] = VMRuntimeInfo(status: .unresolved, controlIdentifier: nil, detail: "No utmctl entry matched this VM name")
-      } else if matches.count == 1 {
-        let match = matches[0]
-        newRuntimeInfo[vm.id] = VMRuntimeInfo(status: match.status, controlIdentifier: match.uuid)
-      } else {
-        newRuntimeInfo[vm.id] = VMRuntimeInfo(status: .unresolved, controlIdentifier: nil, detail: "Multiple utmctl VMs share this name")
-      }
+  private func refreshSnapshotTagsForCurrentSelection() async {
+    guard let qemu else {
+      errorText = "qemu-img unavailable"
+      snapshotTags = []
+      return
     }
-
-    vmRuntimeInfo = newRuntimeInfo
-  }
-
-  private func probeStatusByName(_ name: String, using utmctl: UTMCtl) async throws -> VMRuntimeStatus? {
-    do {
-      return try await utmctl.status(identifier: name)
-    } catch let error as UTMCtlError {
-      switch error {
-      case .failed(_, _, let stderr):
-        if stderr.localizedCaseInsensitiveContains("not found") {
-          return nil
-        }
-        throw error
-      case .notFound, .invalidResponse:
-        return nil
-      }
-    } catch {
-      return nil
-    }
-  }
-
-  private static func normalizedVMName(_ input: String) -> String {
-    let lowercase = input.lowercased()
-    let scalarView = lowercase.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }
-    return String(String.UnicodeScalarView(scalarView))
-  }
-
-  private func refreshSnapshotTagsForCurrentSelection() async throws {
-    guard let qemu else { throw QemuImgError.notFound }
     let svc = SnapshotService(qemu: qemu)
 
     var combinedCounts: [String: (present: Int, total: Int)] = [:]
+    var failures: [String] = []
 
     for vm in scopedVMs {
       if vm.diskURLs.isEmpty { continue }
-      let statuses = try await svc.listTagStatuses(forVM: vm)
-      for st in statuses {
-        let cur = combinedCounts[st.tag] ?? (present: 0, total: 0)
-        combinedCounts[st.tag] = (present: cur.present + st.presentOnDiskCount, total: cur.total + st.totalDiskCount)
+      do {
+        let statuses = try await svc.listTagStatuses(forVM: vm)
+        for st in statuses {
+          let cur = combinedCounts[st.tag] ?? (present: 0, total: 0)
+          combinedCounts[st.tag] = (present: cur.present + st.presentOnDiskCount, total: cur.total + st.totalDiskCount)
+        }
+      } catch {
+        failures.append("\(vm.name): \(error.localizedDescription)")
+        appendLog("Snapshot read failed for ", vm.name, ": ", error.localizedDescription)
       }
     }
 
     snapshotTags = combinedCounts
       .map { SnapshotTagStatus(tag: $0.key, presentOnDiskCount: $0.value.present, totalDiskCount: $0.value.total) }
       .sorted { $0.tag > $1.tag }
+
+    if !failures.isEmpty {
+      errorText = "Some VM disks could not be read:\n" + failures.joined(separator: "\n")
+    }
   }
 
   func createSnapshots() {
@@ -224,6 +214,11 @@ final class AppViewModel: ObservableObject {
   private func _createSnapshots() async {
     guard let qemu else { errorText = "qemu-img unavailable"; return }
     let svc = SnapshotService(qemu: qemu)
+
+    if let reason = snapshotMutationBlockedReason {
+      errorText = reason
+      return
+    }
 
     let tag = createTag.trimmingCharacters(in: .whitespacesAndNewlines)
     if tag.isEmpty {
@@ -243,7 +238,7 @@ final class AppViewModel: ObservableObject {
       }
 
       appendLog("Done creating '", tag, "'.")
-      try await refreshSnapshotTagsForCurrentSelection()
+      await refreshSnapshotTagsForCurrentSelection()
       selectedTagForDelete = tag
       createTag = Self.defaultTimestampTag()
 
@@ -260,28 +255,55 @@ final class AppViewModel: ObservableObject {
     guard let qemu else { errorText = "qemu-img unavailable"; return }
     let svc = SnapshotService(qemu: qemu)
 
+    if let reason = snapshotMutationBlockedReason {
+      errorText = reason
+      return
+    }
+
     isBusy = true
     defer { isBusy = false }
     errorText = nil
 
-    do {
-      for vm in scopedVMs {
-        if vm.diskURLs.isEmpty { continue }
-        appendLog("Deleting snapshot '", tag, "' for ", vm.name)
+    var failures: [String] = []
+
+    for vm in scopedVMs {
+      if vm.diskURLs.isEmpty { continue }
+      appendLog("Deleting snapshot '", tag, "' for ", vm.name)
+      do {
         try await svc.deleteSnapshot(tag: tag, forVM: vm)
+      } catch {
+        let message = "\(vm.name): \(error.localizedDescription)"
+        failures.append(message)
+        appendLog("Delete failed for ", vm.name, ": ", error.localizedDescription)
       }
+    }
 
+    await refreshSnapshotTagsForCurrentSelection()
+    selectedTagForDelete = snapshotTags.first?.tag ?? ""
+
+    if failures.isEmpty {
       appendLog("Done deleting '", tag, "'.")
-      try await refreshSnapshotTagsForCurrentSelection()
-      selectedTagForDelete = snapshotTags.first?.tag ?? ""
-
-    } catch {
-      errorText = error.localizedDescription
+    } else {
+      errorText = "Completed with errors:\n" + failures.joined(separator: "\n")
     }
   }
 
   func start(vm: UTMVirtualMachine) {
     Task { await self.controlVMs([vm], action: .start) }
+  }
+
+  var hasControllableScopedVMs: Bool {
+    scopedVMs.contains { vm in
+      vm.controlIdentifier != nil || vmRuntimeInfo[vm.id]?.controlIdentifier != nil
+    }
+  }
+
+  func startAllInScope() {
+    Task { await self.controlVMs(scopedVMs, action: .start) }
+  }
+
+  func shutdownAllInScope(method: UTMCtlStopMethod = .request) {
+    Task { await self.controlVMs(scopedVMs, action: .stop(method)) }
   }
 
   func suspend(vm: UTMVirtualMachine) {
@@ -320,9 +342,10 @@ final class AppViewModel: ObservableObject {
     errorText = nil
 
     do {
-      let infos = targets.compactMap { vm -> (UTMVirtualMachine, VMRuntimeInfo)? in
-        guard let info = vmRuntimeInfo[vm.id], let _ = info.controlIdentifier else { return nil }
-        return (vm, info)
+      let infos = targets.compactMap { vm -> (UTMVirtualMachine, String)? in
+        let info = vmRuntimeInfo[vm.id]
+        guard let identifier = vm.controlIdentifier ?? info?.controlIdentifier else { return nil }
+        return (vm, identifier)
       }
 
       let skipped = targets.count - infos.count
@@ -334,8 +357,7 @@ final class AppViewModel: ObservableObject {
         return
       }
 
-      for (vm, info) in infos {
-        guard let identifier = info.controlIdentifier else { continue }
+      for (vm, identifier) in infos {
         appendLog("Running \(action.logLabel) for ", vm.name)
         switch action {
         case .start:
@@ -353,6 +375,67 @@ final class AppViewModel: ObservableObject {
     } catch {
       errorText = error.localizedDescription
     }
+  }
+
+  private var selectedVMID: String? {
+    switch selection {
+    case .all:
+      return nil
+    case .vm(let vm):
+      return vm.id
+    }
+  }
+
+  private func restoreSelection(from oldSelectionID: String?) {
+    guard let oldSelectionID else {
+      selection = .all
+      return
+    }
+    if let vm = vms.first(where: { $0.id == oldSelectionID }) {
+      selection = .vm(vm)
+    } else {
+      selection = .all
+    }
+  }
+
+  private static func buildVMsFromUTMCtl(_ remoteList: [UTMCtlVirtualMachine], discoveredBundles: [UTMDiscoveredBundle]) -> [UTMVirtualMachine] {
+    let bundleByUUID = Dictionary(uniqueKeysWithValues: discoveredBundles.map { (canonicalIdentifier($0.uuid), $0) })
+    return remoteList.map { remote in
+      let bundle = bundleByUUID[Self.canonicalIdentifier(remote.uuid)]
+      return UTMVirtualMachine(
+        controlIdentifier: remote.uuid,
+        name: remote.name,
+        bundleURL: bundle?.bundleURL,
+        diskURLs: bundle?.diskURLs ?? []
+      )
+    }
+  }
+
+  private func rebuildVMInventory(fromUTMCtlList remoteList: [UTMCtlVirtualMachine], discoveredBundles: [UTMDiscoveredBundle]) {
+    let mergedVMs = Self.buildVMsFromUTMCtl(remoteList, discoveredBundles: discoveredBundles)
+    vms = mergedVMs
+    applyRuntimeStatuses(fromUTMCtlList: remoteList)
+  }
+
+  private func applyRuntimeStatuses(fromUTMCtlList remoteList: [UTMCtlVirtualMachine]) {
+    let remoteByUUID = Dictionary(uniqueKeysWithValues: remoteList.map { (Self.canonicalIdentifier($0.uuid), $0) })
+    vmRuntimeInfo = Dictionary(uniqueKeysWithValues: vms.map { vm in
+      guard let controlIdentifier = vm.controlIdentifier else {
+        return (vm.id, VMRuntimeInfo(status: .unavailable, controlIdentifier: nil, detail: "No utmctl identifier"))
+      }
+      if let remote = remoteByUUID[Self.canonicalIdentifier(controlIdentifier)] {
+        return (vm.id, VMRuntimeInfo(status: remote.status, controlIdentifier: remote.uuid))
+      } else {
+        return (vm.id, VMRuntimeInfo(status: .unknown, controlIdentifier: controlIdentifier, detail: "State unknown; refresh inventory"))
+      }
+    })
+  }
+
+  private static func canonicalIdentifier(_ raw: String) -> String {
+    raw
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .trimmingCharacters(in: CharacterSet(charactersIn: "{}"))
+      .lowercased()
   }
 
   func runtimeInfo(for vm: UTMVirtualMachine) -> VMRuntimeInfo {
@@ -373,23 +456,40 @@ final class AppViewModel: ObservableObject {
   }
 
   func addSearchDirectory(_ url: URL) {
-    let normalized = url.standardizedFileURL
+    let normalized = url.standardizedFileURL.resolvingSymlinksInPath()
+    if let bookmarkData = makeSecurityScopedBookmark(for: url) {
+      searchDirectoryBookmarksByPath[normalized.path] = bookmarkData
+    }
+
     guard !vmSearchDirectories.contains(where: { $0.standardizedFileURL.path == normalized.path }) else {
+      activateSecurityScopedAccess(forPath: normalized.path)
+      persistSearchDirectories()
       return
     }
     vmSearchDirectories.append(normalized)
     vmSearchDirectories.sort { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+    activateSecurityScopedAccess(forPath: normalized.path)
     persistSearchDirectories()
   }
 
   func removeSearchDirectories(at offsets: IndexSet) {
     for idx in offsets.sorted(by: >) {
-      vmSearchDirectories.remove(at: idx)
+      let removed = vmSearchDirectories.remove(at: idx)
+      let path = removed.standardizedFileURL.resolvingSymlinksInPath().path
+      searchDirectoryBookmarksByPath.removeValue(forKey: path)
+      if let activeURL = activeSecurityScopedDirectoryURLsByPath.removeValue(forKey: path) {
+        activeURL.stopAccessingSecurityScopedResource()
+      }
     }
     persistSearchDirectories()
   }
 
   func clearSearchDirectories() {
+    for (_, activeURL) in activeSecurityScopedDirectoryURLsByPath {
+      activeURL.stopAccessingSecurityScopedResource()
+    }
+    activeSecurityScopedDirectoryURLsByPath.removeAll()
+    searchDirectoryBookmarksByPath.removeAll()
     vmSearchDirectories.removeAll()
     persistSearchDirectories()
   }
@@ -402,25 +502,76 @@ final class AppViewModel: ObservableObject {
     return "Discovering: " + paths.joined(separator: " | ")
   }
 
-  private static func loadSearchDirectories() -> [URL] {
+  private static func loadSearchDirectories() -> (directories: [URL], bookmarksByPath: [String: Data]) {
     let defaults = UserDefaults.standard
     let storedPaths = defaults.array(forKey: searchDirectoriesDefaultsKey) as? [String] ?? []
+    let bookmarksByPath = defaults.dictionary(forKey: searchDirectoryBookmarksDefaultsKey) as? [String: Data] ?? [:]
 
     let urls = storedPaths
-      .map { URL(fileURLWithPath: $0, isDirectory: true).standardizedFileURL }
+      .map { URL(fileURLWithPath: $0, isDirectory: true).standardizedFileURL.resolvingSymlinksInPath() }
 
     if urls.isEmpty {
-      return [UTMDiscovery.defaultDocumentsURL()]
+      return ([UTMDiscovery.defaultDocumentsURL()], bookmarksByPath)
     }
 
     var seen = Set<String>()
-    return urls.filter { seen.insert($0.path).inserted }
+    return (urls.filter { seen.insert($0.path).inserted }, bookmarksByPath)
   }
 
   private func persistSearchDirectories() {
     let paths = vmSearchDirectories
-      .map { $0.standardizedFileURL.path }
+      .map { $0.standardizedFileURL.resolvingSymlinksInPath().path }
     UserDefaults.standard.set(paths, forKey: Self.searchDirectoriesDefaultsKey)
+    UserDefaults.standard.set(searchDirectoryBookmarksByPath, forKey: Self.searchDirectoryBookmarksDefaultsKey)
+  }
+
+  private func restoreSecurityScopedDirectoryAccess() {
+    for url in vmSearchDirectories {
+      let path = url.standardizedFileURL.resolvingSymlinksInPath().path
+      activateSecurityScopedAccess(forPath: path)
+    }
+  }
+
+  private func activateSecurityScopedAccess(forPath path: String) {
+    guard activeSecurityScopedDirectoryURLsByPath[path] == nil else { return }
+    guard let bookmarkData = searchDirectoryBookmarksByPath[path] else { return }
+
+    var isStale = false
+    guard let resolvedURL = try? URL(
+      resolvingBookmarkData: bookmarkData,
+      options: [.withSecurityScope, .withoutUI],
+      relativeTo: nil,
+      bookmarkDataIsStale: &isStale
+    ) else {
+      appendLog("Failed to resolve directory bookmark for ", path)
+      return
+    }
+
+    let scopedURL = resolvedURL.standardizedFileURL.resolvingSymlinksInPath()
+    guard scopedURL.startAccessingSecurityScopedResource() else {
+      appendLog("Failed to access security-scoped directory: ", scopedURL.path)
+      return
+    }
+
+    activeSecurityScopedDirectoryURLsByPath[path] = scopedURL
+
+    if isStale, let refreshedData = makeSecurityScopedBookmark(for: scopedURL) {
+      searchDirectoryBookmarksByPath[path] = refreshedData
+      persistSearchDirectories()
+    }
+  }
+
+  private func makeSecurityScopedBookmark(for url: URL) -> Data? {
+    do {
+      return try url.bookmarkData(
+        options: [.withSecurityScope],
+        includingResourceValuesForKeys: nil,
+        relativeTo: nil
+      )
+    } catch {
+      appendLog("Failed to create directory bookmark for ", url.path, ": ", error.localizedDescription)
+      return nil
+    }
   }
 
   static func loadUTMCtlExecutablePath() -> String {
