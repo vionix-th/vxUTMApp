@@ -1,5 +1,22 @@
 import Foundation
 
+enum RuntimeInventoryError: Error, LocalizedError {
+  case utmctlUnavailable
+  case utmctlPermissionDenied(details: String)
+  case utmctlFailure(details: String)
+
+  var errorDescription: String? {
+    switch self {
+    case .utmctlUnavailable:
+      return "utmctl is required for safe operation. Configure a valid utmctl binary in Settings."
+    case .utmctlPermissionDenied(let details):
+      return "utmctl access is blocked by Apple Events permissions. Grant Automation permission and refresh.\n\(details)"
+    case .utmctlFailure(let details):
+      return details
+    }
+  }
+}
+
 enum VMControlAction {
   case start
   case suspend
@@ -17,9 +34,15 @@ enum VMControlAction {
   }
 }
 
+struct RuntimePathDiagnostics: Sendable {
+  let unresolvedCount: Int
+  let ambiguousCount: Int
+}
+
 struct RuntimeInventory: Sendable {
   let vms: [UTMVirtualMachine]
   let runtimeInfo: [String: VMRuntimeInfo]
+  let pathDiagnostics: RuntimePathDiagnostics
 }
 
 struct VMControlOutcome: Sendable {
@@ -49,24 +72,18 @@ struct RuntimeControlCoordinator: RuntimeControlCoordinating {
     utmctl: UTMCtl?
   ) async throws -> RuntimeInventory {
     guard let utmctl else {
-      let vms = discovered.map { bundle in
-        UTMVirtualMachine(
-          controlIdentifier: nil,
-          name: bundle.name,
-          bundleURL: bundle.bundleURL,
-          diskURLs: bundle.diskURLs
-        )
-      }
-      let runtimeInfo = Dictionary(uniqueKeysWithValues: vms.map {
-        ($0.id, VMRuntimeInfo(status: .unavailable, controlIdentifier: nil, detail: "utmctl not available"))
-      })
-      return RuntimeInventory(vms: vms, runtimeInfo: runtimeInfo)
+      throw RuntimeInventoryError.utmctlUnavailable
     }
 
-    let remoteList = try await utmctl.listVirtualMachines()
-    let vms = buildVMsFromUTMCtl(remoteList, discovered: discovered)
-    let runtimeInfo = buildRuntimeInfo(vms: vms, remoteList: remoteList)
-    return RuntimeInventory(vms: vms, runtimeInfo: runtimeInfo)
+    let remoteList: [UTMCtlVirtualMachine]
+    do {
+      remoteList = try await utmctl.listVirtualMachines()
+    } catch {
+      throw mapRuntimeInventoryError(error)
+    }
+
+    let built = buildVMsAndRuntimeInfo(remoteList: remoteList, discovered: discovered)
+    return RuntimeInventory(vms: built.vms, runtimeInfo: built.runtimeInfo, pathDiagnostics: built.pathDiagnostics)
   }
 
   nonisolated func control(
@@ -98,39 +115,126 @@ struct RuntimeControlCoordinator: RuntimeControlCoordinating {
     )
   }
 
-  private nonisolated func buildVMsFromUTMCtl(
-    _ remoteList: [UTMCtlVirtualMachine],
+  private nonisolated func buildVMsAndRuntimeInfo(
+    remoteList: [UTMCtlVirtualMachine],
     discovered: [UTMDiscoveredBundle]
-  ) -> [UTMVirtualMachine] {
-    let bundleByUUID = Dictionary(uniqueKeysWithValues: discovered.map { (canonicalIdentifier($0.uuid), $0) })
-    return remoteList.map { remote in
-      let bundle = bundleByUUID[canonicalIdentifier(remote.uuid)]
-      return UTMVirtualMachine(
+  ) -> (vms: [UTMVirtualMachine], runtimeInfo: [String: VMRuntimeInfo], pathDiagnostics: RuntimePathDiagnostics) {
+    var availableIndicesByUUID: [String: [Int]] = [:]
+    var availableIndicesByName: [String: [Int]] = [:]
+    var usedDiscoveredIndices: Set<Int> = []
+
+    availableIndicesByUUID.reserveCapacity(discovered.count)
+    availableIndicesByName.reserveCapacity(discovered.count)
+
+    for (index, bundle) in discovered.enumerated() {
+      availableIndicesByUUID[canonicalIdentifier(bundle.uuid), default: []].append(index)
+      availableIndicesByName[canonicalName(bundle.name), default: []].append(index)
+    }
+
+    var vms: [UTMVirtualMachine] = []
+    var runtimeInfo: [String: VMRuntimeInfo] = [:]
+    vms.reserveCapacity(remoteList.count)
+    runtimeInfo.reserveCapacity(remoteList.count)
+
+    var unresolvedCount = 0
+    var ambiguousCount = 0
+
+    for (runtimeIndex, remote) in remoteList.enumerated() {
+      let runtimeIdentifier = canonicalRuntimeIdentifier(remote: remote)
+      let uuidKey = canonicalIdentifier(remote.uuid)
+      let nameKey = canonicalName(remote.name)
+
+      let uuidCandidates = availableCandidateIndices(for: uuidKey, in: availableIndicesByUUID, excluding: usedDiscoveredIndices)
+      let nameCandidates = availableCandidateIndices(for: nameKey, in: availableIndicesByName, excluding: usedDiscoveredIndices)
+
+      let exactCandidates = uuidCandidates.filter { canonicalName(discovered[$0].name) == nameKey }
+
+      let matchedIndex: Int?
+      let pathResolution: VMPathResolution
+
+      if let exact = exactCandidates.first {
+        matchedIndex = exact
+        pathResolution = .resolved
+      } else if let uuidMatch = uuidCandidates.first {
+        matchedIndex = uuidMatch
+        pathResolution = .resolved
+      } else if nameCandidates.count == 1, let uniqueNameMatch = nameCandidates.first {
+        matchedIndex = uniqueNameMatch
+        pathResolution = .resolved
+      } else {
+        matchedIndex = nil
+        if uuidCandidates.count > 1 || nameCandidates.count > 1 {
+          ambiguousCount += 1
+          pathResolution = .ambiguous(reason: "Multiple bundle candidates match this runtime VM. Narrow search directories or rename clones.")
+        } else {
+          unresolvedCount += 1
+          pathResolution = .unresolved(reason: "Bundle path for this runtime VM could not be resolved from configured search directories.")
+        }
+      }
+
+      let matchedBundle = matchedIndex.map { discovered[$0] }
+      if let matchedIndex {
+        usedDiscoveredIndices.insert(matchedIndex)
+      }
+
+      let vm = UTMVirtualMachine(
         controlIdentifier: remote.uuid,
         name: remote.name,
-        bundleURL: bundle?.bundleURL,
-        diskURLs: bundle?.diskURLs ?? []
+        bundleURL: matchedBundle?.bundleURL,
+        diskURLs: matchedBundle?.diskURLs ?? [],
+        runtimeIdentifier: runtimeIdentifier,
+        pathResolution: pathResolution,
+        runtimeSequence: runtimeIndex
+      )
+      vms.append(vm)
+
+      runtimeInfo[vm.id] = VMRuntimeInfo(
+        status: remote.status,
+        controlIdentifier: remote.uuid,
+        detail: pathResolution.blockedReason
       )
     }
+
+    return (
+      vms,
+      runtimeInfo,
+      RuntimePathDiagnostics(unresolvedCount: unresolvedCount, ambiguousCount: ambiguousCount)
+    )
   }
 
-  private nonisolated func buildRuntimeInfo(
-    vms: [UTMVirtualMachine],
-    remoteList: [UTMCtlVirtualMachine]
-  ) -> [String: VMRuntimeInfo] {
-    let remoteByUUID = Dictionary(uniqueKeysWithValues: remoteList.map { (canonicalIdentifier($0.uuid), $0) })
-    return Dictionary(uniqueKeysWithValues: vms.map { vm in
-      guard let controlIdentifier = vm.controlIdentifier else {
-        return (vm.id, VMRuntimeInfo(status: .unavailable, controlIdentifier: nil, detail: "No utmctl identifier"))
+  private nonisolated func availableCandidateIndices(
+    for key: String,
+    in source: [String: [Int]],
+    excluding used: Set<Int>
+  ) -> [Int] {
+    (source[key] ?? []).filter { !used.contains($0) }
+  }
+
+  private nonisolated func mapRuntimeInventoryError(_ error: Error) -> RuntimeInventoryError {
+    if let utmctlError = error as? UTMCtlError {
+      switch utmctlError {
+      case .notFound:
+        return .utmctlUnavailable
+      case .failed:
+        let message = utmctlError.localizedDescription
+        if message.contains("-1743") {
+          return .utmctlPermissionDenied(details: message)
+        }
+        return .utmctlFailure(details: message)
+      case .invalidResponse:
+        return .utmctlFailure(details: utmctlError.localizedDescription)
       }
-      if let remote = remoteByUUID[canonicalIdentifier(controlIdentifier)] {
-        return (vm.id, VMRuntimeInfo(status: remote.status, controlIdentifier: remote.uuid))
-      }
-      return (
-        vm.id,
-        VMRuntimeInfo(status: .unknown, controlIdentifier: controlIdentifier, detail: "State unknown; refresh inventory")
-      )
-    })
+    }
+    return .utmctlFailure(details: error.localizedDescription)
+  }
+
+  private nonisolated func canonicalRuntimeIdentifier(remote: UTMCtlVirtualMachine) -> String {
+    let uuid = canonicalIdentifier(remote.uuid)
+    return uuid.isEmpty ? canonicalName(remote.name) : uuid
+  }
+
+  private nonisolated func canonicalName(_ raw: String) -> String {
+    raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
   }
 
   private nonisolated func canonicalIdentifier(_ raw: String) -> String {

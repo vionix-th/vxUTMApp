@@ -128,7 +128,10 @@ final class AppViewModel: ObservableObject {
       )
     } catch {
       utmctl = nil
+      vms = []
+      snapshotTags = []
       vmRuntimeInfo = [:]
+      errorText = RuntimeInventoryError.utmctlUnavailable.localizedDescription
       appendLog("UTM control unavailable: ", error.localizedDescription)
     }
   }
@@ -152,7 +155,12 @@ final class AppViewModel: ObservableObject {
 
   var snapshotMutationBlockedReason: String? {
     guard utmctl != nil else {
-      return "Snapshot create/delete requires utmctl so runtime state can be verified as stopped."
+      return RuntimeInventoryError.utmctlUnavailable.localizedDescription
+    }
+
+    let unresolved = unresolvedScopedVMMessages
+    if !unresolved.isEmpty {
+      return "Resolve VM bundle paths before snapshot changes: " + unresolved.joined(separator: ", ")
     }
 
     let targetVMs = scopedVMs.filter { !$0.diskURLs.isEmpty }
@@ -200,12 +208,19 @@ final class AppViewModel: ObservableObject {
   }
 
   var backupTargetVMs: [UTMVirtualMachine] {
-    scopedVMs.filter { $0.bundleURL != nil }
+    scopedVMs.filter { vm in
+      vm.bundleURL != nil && vm.pathResolution.blockedReason == nil
+    }
   }
 
   var backupBlockedReason: String? {
     guard utmctl != nil else {
-      return "Backup requires utmctl so runtime state can be verified as stopped."
+      return RuntimeInventoryError.utmctlUnavailable.localizedDescription
+    }
+
+    let unresolved = unresolvedScopedVMMessages
+    if !unresolved.isEmpty {
+      return "Resolve VM bundle paths before backup: " + unresolved.joined(separator: ", ")
     }
 
     let targets = backupTargetVMs
@@ -281,6 +296,11 @@ final class AppViewModel: ObservableObject {
     errorText = nil
 
     do {
+      guard utmctl != nil else {
+        applyHardBlockedInventoryState(RuntimeInventoryError.utmctlUnavailable.localizedDescription)
+        return
+      }
+
       let discoveredBundles = try await discoveryService.discoverBundles(baseDirectories: vmSearchDirectories)
       guard shouldCommitRefresh(generation) else { return }
       let oldSelectionID = selectedVMID
@@ -299,6 +319,10 @@ final class AppViewModel: ObservableObject {
       } else if !snapshotTags.contains(where: { $0.tag == selectedTagForDelete }) {
         selectedTagForDelete = snapshotTags.first?.tag ?? ""
       }
+    } catch let error as RuntimeInventoryError {
+      if shouldCommitRefresh(generation) {
+        applyHardBlockedInventoryState(error.localizedDescription)
+      }
     } catch is CancellationError {
       return
     } catch {
@@ -309,6 +333,9 @@ final class AppViewModel: ObservableObject {
   }
 
   private func refreshRuntimeStatuses() async throws {
+    guard utmctl != nil else {
+      throw RuntimeInventoryError.utmctlUnavailable
+    }
     let discoveredBundles = try await discoveryService.discoverBundles(baseDirectories: vmSearchDirectories)
     let oldSelectionID = selectedVMID
     let inventory = try await runtimeCoordinator.buildInventory(discovered: discoveredBundles, utmctl: utmctl)
@@ -547,7 +574,8 @@ final class AppViewModel: ObservableObject {
   }
 
   var hasControllableScopedVMs: Bool {
-    scopedVMs.contains { vm in
+    guard utmctl != nil else { return false }
+    return scopedVMs.contains { vm in
       vm.controlIdentifier != nil || vmRuntimeInfo[vm.id]?.controlIdentifier != nil
     }
   }
@@ -580,7 +608,7 @@ final class AppViewModel: ObservableObject {
 
   private func controlVMs(_ targets: [UTMVirtualMachine], action: VMControlAction) async {
     guard let utmctl else {
-      errorText = "utmctl unavailable"
+      applyHardBlockedInventoryState(RuntimeInventoryError.utmctlUnavailable.localizedDescription)
       return
     }
 
@@ -617,6 +645,21 @@ final class AppViewModel: ObservableObject {
     } catch {
       errorText = error.localizedDescription
     }
+  }
+
+  private var unresolvedScopedVMMessages: [String] {
+    scopedVMs.compactMap { vm in
+      guard let reason = vm.pathResolution.blockedReason else { return nil }
+      return "\(vm.name) (\(reason))"
+    }
+  }
+
+  private func applyHardBlockedInventoryState(_ message: String) {
+    vms = []
+    vmRuntimeInfo = [:]
+    snapshotTags = []
+    selection = .all
+    errorText = message
   }
 
   private var selectedVMID: String? {

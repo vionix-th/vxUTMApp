@@ -5,8 +5,8 @@ Project-wide instructions for coding agents working in this repository.
 ## 1) Project Scope
 - Product: `vxUTMApp` (macOS, SwiftUI).
 - Primary capabilities:
-  - Discover UTM VM bundles and qcow2 disks.
-  - Read/control runtime state through `utmctl`.
+  - Build VM inventory from `utmctl` and augment with bundle/disk paths from filesystem discovery.
+  - Read/control runtime state through `utmctl` (authoritative source).
   - Create/delete qcow2 snapshots through `qemu-img`.
   - Run non-blocking VM backup jobs (copy + zip).
 - Architecture style: single-feature desktop app with UI in `ContentView`, orchestration in `AppViewModel`, thin service/adapters for external tools.
@@ -29,7 +29,7 @@ Project-wide instructions for coding agents working in this repository.
 
 ## 3) External Dependencies and Platform Constraints
 - External binaries:
-  - `utmctl` (default `/Applications/UTM.app/Contents/MacOS/utmctl`, configurable).
+  - `utmctl` (default `/Applications/UTM.app/Contents/MacOS/utmctl`, configurable, mandatory for inventory/actions).
   - `qemu-img` (Homebrew/PATH lookup).
 - macOS permissions:
   - Apple Events automation is required for UTM control (`-1743` handling is implemented).
@@ -37,6 +37,7 @@ Project-wide instructions for coding agents working in this repository.
 - Backup archiving uses `/usr/bin/ditto`.
 
 ## 4) Non-Negotiable Safety Rules
+- Treat `utmctl` as a hard safety dependency. If unavailable/blocked, inventory and inventory-dependent actions must enter a blocked state.
 - Never delete or mutate source VM bundles/disks as part of backup.
 - Restrict file deletions to validated app-owned transient paths only.
 - Keep snapshot mutation guarded by runtime-state checks (stopped-only for scoped targets).
@@ -46,7 +47,10 @@ Project-wide instructions for coding agents working in this repository.
 ## 5) Behavioral Invariants
 
 ### Discovery and identity
-- VM identity resolution merges `utmctl list` with discovered bundles by canonical UUID.
+- `utmctl list` is the authoritative inventory source and ordering.
+- Filesystem discovery is augmentation-only for resolving bundle/disk paths.
+- VM identity is composite and deterministic (runtime identity plus resolved/unresolved bundle identity), not UUID-only.
+- Matching from runtime rows to discovered bundles must be deterministic and non-collapsing (supports clone scenarios with duplicate UUIDs).
 - Preserve stable ordering and deterministic selection restoration after refresh.
 
 ### Runtime control
@@ -57,12 +61,14 @@ Project-wide instructions for coding agents working in this repository.
 - Scope semantics:
   - `All VMs` applies create/delete to all scoped VMs with qcow2 disks.
   - Single VM scope applies only to that VM.
+- VMs with unresolved or ambiguous bundle-path mapping must be visible for runtime control but blocked for snapshot mutation with explicit reasons.
 - Cross-disk status aggregation uses tag consistency (`present/total`).
 
 ### Backup operations
 - One archive per VM target.
 - Execution is asynchronous and abortable.
 - Progress is visible at overall and per-job levels.
+- VMs with unresolved or ambiguous bundle-path mapping must be blocked for backup with explicit reasons.
 - Cancellation/failure paths must leave no unsafe partial state (best-effort cleanup with guardrails).
 
 ## 6) UI/UX Expectations
@@ -129,6 +135,7 @@ Project-wide instructions for coding agents working in this repository.
 - New external-system integrations MUST expose protocol seams suitable for tests/mocks.
 
 ### Discovery/background I/O policy
+- Inventory authority MUST come from `utmctl` runtime rows first; discovery may only enrich those rows with filesystem metadata.
 - VM discovery (`UTMDiscovery` orchestration), directory enumeration, and similar heavy I/O MUST run off main actor through a service/actor boundary.
 - Main-actor code MUST only publish results and update selection/state.
 
@@ -157,7 +164,7 @@ Project-wide instructions for coding agents working in this repository.
 ### No backsliding rules
 - New backup copy/archive/path-safety logic MUST NOT be added to `AppViewModel`; add it to `BackupCoordinator`.
 - New settings persistence, bookmark resolution, or security-scoped lifecycle logic MUST NOT be added to `AppViewModel`; add it to `SettingsStore`.
-- New VM runtime command execution and inventory merge logic MUST go through `RuntimeControlCoordinator`.
+- New VM runtime command execution and inventory merge logic MUST go through `RuntimeControlCoordinator` with `utmctl` as the primary source.
 - New snapshot aggregation/create/delete orchestration MUST go through `SnapshotCoordinator`.
 
 ### Contract and composition discipline
