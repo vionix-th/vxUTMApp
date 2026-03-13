@@ -52,6 +52,7 @@ final class AppViewModel: ObservableObject {
   @Published var backupJobs: [BackupJob] = []
   @Published var isBackingUp: Bool = false
   @Published var backupCancellationRequested: Bool = false
+  @Published var lastRuntimeSyncAt: Date? = nil
 
   private var qemu: QemuImg? = nil
   private var utmctl: UTMCtl? = nil
@@ -60,6 +61,10 @@ final class AppViewModel: ObservableObject {
   private var activeBackupVMCounts: [String: Int] = [:]
   private var refreshTask: Task<Void, Never>?
   private var refreshGeneration: UInt64 = 0
+  private var runtimePollingTask: Task<Void, Never>?
+  private var runtimeSyncGeneration: UInt64 = 0
+  private var inventoryRevision: UInt64 = 0
+  private var isApplicationActive = true
 
   private let discoveryService: any VMDiscoveryServicing
   private let utmctlFactory: any UTMControllingFactory
@@ -97,6 +102,7 @@ final class AppViewModel: ObservableObject {
 
   deinit {
     refreshTask?.cancel()
+    runtimePollingTask?.cancel()
     for task in backupTasks.values {
       task.cancel()
     }
@@ -131,6 +137,8 @@ final class AppViewModel: ObservableObject {
       vms = []
       snapshotTags = []
       vmRuntimeInfo = [:]
+      inventoryRevision &+= 1
+      lastRuntimeSyncAt = nil
       errorText = RuntimeInventoryError.utmctlUnavailable.localizedDescription
       appendLog("UTM control unavailable: ", error.localizedDescription)
     }
@@ -264,6 +272,73 @@ final class AppViewModel: ObservableObject {
     isBackingUp && !backupTasks.isEmpty
   }
 
+  var runtimeStatusSummary: String {
+    guard let lastRuntimeSyncAt else {
+      return "Status not synced yet."
+    }
+
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeStyle = .medium
+    formatter.dateStyle = .none
+
+    let prefix = runtimeStatusIsStale ? "Status may be stale." : "Last sync"
+    return "\(prefix) \(formatter.string(from: lastRuntimeSyncAt))"
+  }
+
+  var runtimeStatusIsStale: Bool {
+    guard let lastRuntimeSyncAt else { return true }
+    return Date().timeIntervalSince(lastRuntimeSyncAt) > runtimeStaleThreshold
+  }
+
+  func startRuntimePolling() {
+    guard runtimePollingTask == nil else { return }
+    runtimePollingTask = Task { [weak self] in
+      await self?.runRuntimePollingLoop()
+    }
+  }
+
+  func stopRuntimePolling() {
+    runtimePollingTask?.cancel()
+    runtimePollingTask = nil
+  }
+
+  func setApplicationActive(_ isActive: Bool) {
+    isApplicationActive = isActive
+    guard isActive else { return }
+    runActionTask { [weak self] in
+      guard let self else { return }
+      do {
+        try await self.refreshRuntimeStatuses(recordErrors: true)
+      } catch {
+        self.errorText = error.localizedDescription
+      }
+    }
+  }
+
+  func handleSelectionChanged() {
+    runActionTask { [weak self] in
+      guard let self else { return }
+      await self.refreshSnapshotTagsForCurrentSelection()
+      self.normalizeSelectedTagSelection()
+    }
+  }
+
+  func handleUTMApplicationLifecycleChange() {
+    refresh()
+  }
+
+  func handleWindowBecameKey() {
+    runActionTask { [weak self] in
+      guard let self else { return }
+      do {
+        try await self.refreshRuntimeStatuses(recordErrors: false)
+      } catch {
+        // Ignore opportunistic refresh failures here. Explicit refresh and active-state sync surface errors.
+      }
+    }
+  }
+
   func refresh() {
     refreshTask?.cancel()
     refreshGeneration &+= 1
@@ -309,16 +384,14 @@ final class AppViewModel: ObservableObject {
       guard shouldCommitRefresh(generation) else { return }
       vms = inventory.vms
       vmRuntimeInfo = inventory.runtimeInfo
+      inventoryRevision &+= 1
+      lastRuntimeSyncAt = Date()
 
       restoreSelection(from: oldSelectionID)
       await refreshSnapshotTagsForCurrentSelection(generation: generation)
       guard shouldCommitRefresh(generation) else { return }
 
-      if selectedTagForDelete.isEmpty {
-        selectedTagForDelete = snapshotTags.first?.tag ?? ""
-      } else if !snapshotTags.contains(where: { $0.tag == selectedTagForDelete }) {
-        selectedTagForDelete = snapshotTags.first?.tag ?? ""
-      }
+      normalizeSelectedTagSelection()
     } catch let error as RuntimeInventoryError {
       if shouldCommitRefresh(generation) {
         applyHardBlockedInventoryState(error.localizedDescription)
@@ -332,16 +405,47 @@ final class AppViewModel: ObservableObject {
     }
   }
 
-  private func refreshRuntimeStatuses() async throws {
-    guard utmctl != nil else {
+  private func refreshRuntimeStatuses(
+    triggerFullRefreshOnInventoryChange: Bool = true,
+    recordErrors: Bool = true
+  ) async throws {
+    guard let utmctl else {
       throw RuntimeInventoryError.utmctlUnavailable
     }
-    let discoveredBundles = try await discoveryService.discoverBundles(baseDirectories: vmSearchDirectories)
-    let oldSelectionID = selectedVMID
-    let inventory = try await runtimeCoordinator.buildInventory(discovered: discoveredBundles, utmctl: utmctl)
-    vms = inventory.vms
-    vmRuntimeInfo = inventory.runtimeInfo
-    restoreSelection(from: oldSelectionID)
+
+    runtimeSyncGeneration &+= 1
+    let syncGeneration = runtimeSyncGeneration
+    let baseRevision = inventoryRevision
+    let currentVMs = vms
+    let currentRuntimeInfo = vmRuntimeInfo
+
+    do {
+      let reconciliation = try await runtimeCoordinator.reconcileRuntimeInfo(
+        currentVMs: currentVMs,
+        runtimeInfo: currentRuntimeInfo,
+        utmctl: utmctl
+      )
+      guard shouldCommitRuntimeSync(syncGeneration: syncGeneration, baseRevision: baseRevision) else { return }
+
+      let shouldRefreshSnapshots = applyRuntimeStatusReconciliation(reconciliation)
+      lastRuntimeSyncAt = Date()
+
+      if reconciliation.inventoryChanged, triggerFullRefreshOnInventoryChange {
+        appendLog("Runtime inventory changed outside the current view state. Running full refresh.")
+        refresh()
+        return
+      }
+
+      if shouldRefreshSnapshots {
+        await refreshSnapshotTagsForCurrentSelection()
+        normalizeSelectedTagSelection()
+      }
+    } catch {
+      if recordErrors, shouldCommitRuntimeSync(syncGeneration: syncGeneration, baseRevision: baseRevision) {
+        errorText = error.localizedDescription
+      }
+      throw error
+    }
   }
 
   private func refreshSnapshotTagsForCurrentSelection(generation: UInt64? = nil) async {
@@ -378,6 +482,56 @@ final class AppViewModel: ObservableObject {
         appendLog("Snapshot read failed for ", failure)
       }
       errorText = "Some VM disks could not be read:\n" + result.failures.joined(separator: "\n")
+    }
+  }
+
+  private func shouldCommitRuntimeSync(syncGeneration: UInt64, baseRevision: UInt64) -> Bool {
+    !Task.isCancelled && runtimeSyncGeneration == syncGeneration && inventoryRevision == baseRevision
+  }
+
+  private func applyRuntimeStatusReconciliation(_ reconciliation: RuntimeStatusReconciliation) -> Bool {
+    let previousRuntimeInfo = vmRuntimeInfo
+    vmRuntimeInfo = reconciliation.runtimeInfo
+
+    let scopedIDs = Set(scopedVMs.map(\.id))
+    return scopedIDs.contains { vmID in
+      let previous = previousRuntimeInfo[vmID]?.status
+      let current = reconciliation.runtimeInfo[vmID]?.status
+      guard previous != current else { return false }
+      return previous == .stopped || current == .stopped
+    }
+  }
+
+  private func normalizeSelectedTagSelection() {
+    if selectedTagForDelete.isEmpty {
+      selectedTagForDelete = snapshotTags.first?.tag ?? ""
+    } else if !snapshotTags.contains(where: { $0.tag == selectedTagForDelete }) {
+      selectedTagForDelete = snapshotTags.first?.tag ?? ""
+    }
+  }
+
+  private var runtimePollingInterval: TimeInterval {
+    if vmRuntimeInfo.values.contains(where: { $0.status.isTransitioning }) {
+      return isApplicationActive ? 2 : 10
+    }
+    return isApplicationActive ? 10 : 30
+  }
+
+  private var runtimeStaleThreshold: TimeInterval {
+    max(runtimePollingInterval * 2.5, 15)
+  }
+
+  private func runRuntimePollingLoop() async {
+    while !Task.isCancelled {
+      let interval = runtimePollingInterval
+      try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+      guard !Task.isCancelled else { return }
+
+      do {
+        try await refreshRuntimeStatuses(recordErrors: false)
+      } catch {
+        // Keep polling. Manual refresh and app-activation sync surface failures to the UI.
+      }
     }
   }
 
@@ -650,13 +804,15 @@ final class AppViewModel: ObservableObject {
     }
 
     do {
-      _ = try await runtimeCoordinator.control(
+      let outcome = try await runtimeCoordinator.control(
         targets: targets,
         runtimeInfo: vmRuntimeInfo,
         action: action,
         utmctl: utmctl
       )
+      applyOptimisticRuntimeStatus(action: action, to: outcome.controlledVMs)
       try await refreshRuntimeStatuses()
+      await awaitRuntimeConvergence(for: outcome.controlledVMs, expectedStatus: action.expectedStatus)
       appendLog("Done: \(action.logLabel)")
     } catch {
       errorText = error.localizedDescription
@@ -675,7 +831,49 @@ final class AppViewModel: ObservableObject {
     vmRuntimeInfo = [:]
     snapshotTags = []
     selection = .all
+    inventoryRevision &+= 1
+    lastRuntimeSyncAt = nil
     errorText = message
+  }
+
+  private func applyOptimisticRuntimeStatus(action: VMControlAction, to targets: [UTMVirtualMachine]) {
+    let status = action.optimisticStatus
+    for vm in targets {
+      let current = vmRuntimeInfo[vm.id]
+      vmRuntimeInfo[vm.id] = VMRuntimeInfo(
+        status: status,
+        controlIdentifier: current?.controlIdentifier ?? vm.controlIdentifier,
+        detail: current?.detail ?? vm.pathResolution.blockedReason
+      )
+    }
+  }
+
+  private func awaitRuntimeConvergence(
+    for targets: [UTMVirtualMachine],
+    expectedStatus: VMRuntimeStatus,
+    timeout: TimeInterval = 15
+  ) async {
+    let targetIDs = Set(targets.map(\.id))
+    guard !targetIDs.isEmpty else { return }
+
+    let startedAt = Date()
+    while Date().timeIntervalSince(startedAt) < timeout {
+      if targetIDs.allSatisfy({ vmRuntimeInfo[$0]?.status == expectedStatus }) {
+        return
+      }
+
+      try? await Task.sleep(nanoseconds: 1_000_000_000)
+      guard !Task.isCancelled else { return }
+
+      do {
+        try await refreshRuntimeStatuses()
+      } catch {
+        return
+      }
+    }
+
+    let names = targets.map(\.name).joined(separator: ", ")
+    appendLog("Runtime convergence timeout for \(names). Expected \(expectedStatus.displayLabel).")
   }
 
   private var selectedVMID: String? {

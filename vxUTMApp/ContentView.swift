@@ -1,8 +1,10 @@
+import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
 struct ContentView: View {
   @StateObject private var vm: AppViewModel
+  @Environment(\.scenePhase) private var scenePhase
 
   @State private var showDeleteConfirm = false
   @State private var showSettings = false
@@ -134,6 +136,26 @@ struct ContentView: View {
       .onAppear {
         vm.bootstrap()
         vm.refresh()
+        vm.startRuntimePolling()
+      }
+      .onDisappear {
+        vm.stopRuntimePolling()
+      }
+      .onChange(of: scenePhase) { _, newPhase in
+        vm.setApplicationActive(newPhase == .active)
+      }
+      .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
+        vm.handleWindowBecameKey()
+      }
+      .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didLaunchApplicationNotification)) { note in
+        guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+              app.bundleIdentifier == "com.utmapp.UTM" else { return }
+        vm.handleUTMApplicationLifecycleChange()
+      }
+      .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didTerminateApplicationNotification)) { note in
+        guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+              app.bundleIdentifier == "com.utmapp.UTM" else { return }
+        vm.handleUTMApplicationLifecycleChange()
       }
     }
     .frame(minWidth: 960, minHeight: 620)
@@ -147,7 +169,7 @@ struct ContentView: View {
       get: { vm.selection },
       set: { newValue in
         vm.selection = newValue ?? .all
-        vm.refresh()
+        vm.handleSelectionChanged()
       }
     )
   }
@@ -264,6 +286,13 @@ struct ContentView: View {
   private var vmRuntimePanel: some View {
     GroupBox {
       VStack(alignment: .leading, spacing: 8) {
+        HStack {
+          Text(vm.runtimeStatusSummary)
+            .font(.caption)
+            .foregroundStyle(vm.runtimeStatusIsStale ? .orange : .secondary)
+          Spacer()
+        }
+
         if vm.scopedVMs.isEmpty {
           Text("No VMs discovered.")
             .foregroundStyle(.secondary)

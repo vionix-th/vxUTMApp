@@ -32,6 +32,28 @@ enum VMControlAction {
       return "stop (\(method.label.lowercased()))"
     }
   }
+
+  var optimisticStatus: VMRuntimeStatus {
+    switch self {
+    case .start:
+      return .starting
+    case .suspend:
+      return .pausing
+    case .stop:
+      return .stopping
+    }
+  }
+
+  var expectedStatus: VMRuntimeStatus {
+    switch self {
+    case .start:
+      return .started
+    case .suspend:
+      return .paused
+    case .stop:
+      return .stopped
+    }
+  }
 }
 
 struct RuntimePathDiagnostics: Sendable {
@@ -43,6 +65,11 @@ struct RuntimeInventory: Sendable {
   let vms: [UTMVirtualMachine]
   let runtimeInfo: [String: VMRuntimeInfo]
   let pathDiagnostics: RuntimePathDiagnostics
+}
+
+struct RuntimeStatusReconciliation: Sendable {
+  let runtimeInfo: [String: VMRuntimeInfo]
+  let inventoryChanged: Bool
 }
 
 struct VMControlOutcome: Sendable {
@@ -62,6 +89,12 @@ protocol RuntimeControlCoordinating: Sendable {
     action: VMControlAction,
     utmctl: UTMCtl
   ) async throws -> VMControlOutcome
+
+  nonisolated func reconcileRuntimeInfo(
+    currentVMs: [UTMVirtualMachine],
+    runtimeInfo: [String: VMRuntimeInfo],
+    utmctl: UTMCtl?
+  ) async throws -> RuntimeStatusReconciliation
 }
 
 struct RuntimeControlCoordinator: RuntimeControlCoordinating {
@@ -112,6 +145,63 @@ struct RuntimeControlCoordinator: RuntimeControlCoordinating {
     return VMControlOutcome(
       controlledVMs: controllable.map(\.0),
       skippedCount: targets.count - controllable.count
+    )
+  }
+
+  nonisolated func reconcileRuntimeInfo(
+    currentVMs: [UTMVirtualMachine],
+    runtimeInfo: [String: VMRuntimeInfo],
+    utmctl: UTMCtl?
+  ) async throws -> RuntimeStatusReconciliation {
+    guard let utmctl else {
+      throw RuntimeInventoryError.utmctlUnavailable
+    }
+
+    let remoteList: [UTMCtlVirtualMachine]
+    do {
+      remoteList = try await utmctl.listVirtualMachines()
+    } catch {
+      throw mapRuntimeInventoryError(error)
+    }
+
+    let remoteByIdentifier = Dictionary(
+      uniqueKeysWithValues: remoteList.map { (canonicalIdentifier($0.uuid), $0) }
+    )
+
+    var reconciledRuntimeInfo: [String: VMRuntimeInfo] = [:]
+    reconciledRuntimeInfo.reserveCapacity(currentVMs.count)
+
+    var matchedIdentifiers: Set<String> = []
+    var inventoryChanged = remoteList.count != currentVMs.count
+
+    for vm in currentVMs {
+      let currentInfo = runtimeInfo[vm.id]
+      let identifier = canonicalIdentifier(vm.controlIdentifier ?? currentInfo?.controlIdentifier ?? "")
+      guard !identifier.isEmpty, let remote = remoteByIdentifier[identifier] else {
+        inventoryChanged = true
+        reconciledRuntimeInfo[vm.id] = currentInfo ?? VMRuntimeInfo(
+          status: .unknown,
+          controlIdentifier: vm.controlIdentifier,
+          detail: vm.pathResolution.blockedReason
+        )
+        continue
+      }
+
+      matchedIdentifiers.insert(identifier)
+      reconciledRuntimeInfo[vm.id] = VMRuntimeInfo(
+        status: remote.status,
+        controlIdentifier: remote.uuid,
+        detail: currentInfo?.detail ?? vm.pathResolution.blockedReason
+      )
+    }
+
+    if matchedIdentifiers.count != remoteByIdentifier.count {
+      inventoryChanged = true
+    }
+
+    return RuntimeStatusReconciliation(
+      runtimeInfo: reconciledRuntimeInfo,
+      inventoryChanged: inventoryChanged
     )
   }
 

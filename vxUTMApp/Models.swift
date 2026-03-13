@@ -121,6 +121,15 @@ public enum VMRuntimeStatus: String, Hashable {
   case unresolved
   case unknown
 
+  public nonisolated var isTransitioning: Bool {
+    switch self {
+    case .starting, .pausing, .resuming, .stopping:
+      return true
+    case .stopped, .started, .paused, .unavailable, .unresolved, .unknown:
+      return false
+    }
+  }
+
   public var displayLabel: String {
     switch self {
     case .stopped: return "Stopped"
